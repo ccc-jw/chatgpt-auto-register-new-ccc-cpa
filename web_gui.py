@@ -1343,17 +1343,38 @@ def _run(config, count, retries, concurrency=1):
                     thread_sms.cancel()
                 except Exception:
                     pass
-            _state["results"].append(result)
 
-            if not result["ok"]:
-                _log(f"{tag} 澶辫触: {result.get('phone','?')} {result.get('error','')}", "error")
+            phone_ok = result.get("phone_ok", False)
+            final_ok = result.get("final_ok", False)
+            status = result.get("status", "register_failed")
+            failure_stage = result.get("failure_stage", "")
+            retryable = result.get("retryable", False)
+
+            _record_result(result)
+
+            # Log stage status
+            if final_ok:
+                _log(f"{tag} 成功: {result.get('phone','?')}  最终状态: final_ok", "success")
+            elif phone_ok:
+                _log(f"{tag} 手机号成功: {result.get('phone','?')}  状态: {status}  可补跑: {retryable}", "warn")
+            else:
+                _log(f"{tag} 失败: {result.get('phone','?')} {result.get('error','')}  阶段: {failure_stage}", "error")
+
+            # Count based on final_ok (or phone_ok if no_phase2)
+            if final_ok:
+                finish_registration(True)
+                ok_num = counters["ok"]
+                sys.stdout.flush()
+                _log(f"{tag} 注册成功: {result['phone']} [{ok_num}/{count}]", "success", thread_id=thread_id)
+            elif phone_ok and retryable:
+                # Phone succeeded but Phase2 not done yet — still count as partial success
+                finish_registration(True)
+                ok_num = counters["ok"]
+                sys.stdout.flush()
+                _log(f"{tag} 手机号成功 (待Phase2): {result['phone']} [{ok_num}/{count}]", "warn", thread_id=thread_id)
+            else:
                 finish_registration(False)
                 continue
-
-            finish_registration(True)
-            ok_num = counters["ok"]
-            sys.stdout.flush()
-            _log(f"{tag} 娉ㄥ唽鎴愬姛: {result['phone']} [{ok_num}/{count}]", "success", thread_id=thread_id)
 
             # ---- Debug mode: pause (single-thread only) ----
             if debug_mode:
@@ -2064,17 +2085,36 @@ def _run(config, count, retries, concurrency=1):
                     except Exception:
                         pass
 
+                phone_ok = result.get("phone_ok", False)
+                final_ok = result.get("final_ok", False)
+                status = result.get("status", "register_failed")
+                failure_stage = result.get("failure_stage", "")
+                retryable = result.get("retryable", False)
+
                 _record_result(result)
 
-                if not result.get("ok"):
-                    tlog(f"{tag} 澶辫触: {result.get('phone', '?')} {result.get('error', '')}", "error")
+                # Log stage status
+                if final_ok:
+                    tlog(f"{tag} 成功: {result.get('phone','?')}  最终状态: final_ok", "success")
+                elif phone_ok:
+                    tlog(f"{tag} 手机号成功: {result.get('phone','?')}  状态: {status}  可补跑: {retryable}", "warn")
+                else:
+                    tlog(f"{tag} 失败: {result.get('phone','?')} {result.get('error','')}  阶段: {failure_stage}", "error")
+
+                # Count based on final_ok (or phone_ok if no_phase2)
+                if final_ok:
+                    finish_registration(True)
+                    ok_num = counters["ok"]
+                    sys.stdout.flush()
+                    tlog(f"{tag} 注册成功: {result['phone']} [{ok_num}/{count}]", "success")
+                elif phone_ok and retryable:
+                    finish_registration(True)
+                    ok_num = counters["ok"]
+                    sys.stdout.flush()
+                    tlog(f"{tag} 手机号成功 (待Phase2): {result['phone']} [{ok_num}/{count}]", "warn")
+                else:
                     finish_registration(False)
                     continue
-
-                finish_registration(True)
-                ok_num = counters["ok"]
-                sys.stdout.flush()
-                tlog(f"{tag} 娉ㄥ唽鎴愬姛: {result['phone']} [{ok_num}/{count}]", "success")
 
                 if debug_mode:
                     tlog("=" * 40, "warn")
