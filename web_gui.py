@@ -201,18 +201,20 @@ def api_config():
     if request.method == "POST":
         d = request.json or {}
         cfg = ar.load_config()
-        for k in ["api_key", "proxy", "country", "service", "password", "max_price", "code_timeout",
-                   "provider", "sms_timeout", "imap_user", "imap_pass", "sub2api_url", "sub2api_email",
+        for k in ["sms_provider", "api_key", "proxy", "countries", "service", "password", "max_price", "code_timeout",
+                   "sms_timeout", "imap_user", "imap_pass", "sub2api_url", "sub2api_email",
                    "sub2api_pwd", "sub2api_group", "sub2api_proxy_id", "bind_email", "icloud_cookies",
                 "email_provider", "mailmanage_key", "mailmanage_category", "mailmanage_keyword", "outlook_pool",
                 "debug_mode", "no_phase2", "phase2_auto_skip",
                 "plus_method", "plus_email", "plus_phone", "plus_pin",
                 "plus_country", "plus_currency"]:
             if k in d:
-                if k == "api_key": cfg["sms"]["api_key"] = d[k]
+                if k == "sms_provider": cfg["sms"]["provider"] = d[k]
+                elif k == "api_key": cfg["sms"]["api_key"] = d[k]
+                elif k == "countries": cfg["sms"]["countries"] = [c.strip() for c in d[k].split(",") if c.strip()]
                 elif k in ("code_timeout", "sms_timeout"): cfg[k] = int(d[k]) if d[k] else 30
                 elif k == "password": cfg["register"]["password"] = d[k]
-                elif k in ("proxy", "country", "service", "max_price", "provider"): cfg[k] = d[k]
+                elif k in ("proxy", "service", "max_price"): cfg["sms"][k] = d[k]
                 elif k == "imap_user": cfg["icloud"] = cfg.get("icloud", {}); cfg["icloud"]["user"] = d[k]
                 elif k == "imap_pass": cfg["icloud"] = cfg.get("icloud", {}); cfg["icloud"]["pass"] = d[k]
                 elif k == "sub2api_url": cfg["sub2api"] = cfg.get("sub2api", {}); cfg["sub2api"]["url"] = d[k]
@@ -2348,9 +2350,14 @@ button:disabled{opacity:0.4;cursor:not-allowed}
     <div class="row">
       <div class="col">
         <div class="card"><h2>注册配置</h2>
-          <label>SMSBower Key</label><input id="api_key" placeholder="your-smsbower-key">
+          <label>短信平台</label>
+          <select id="sms_provider" style="width:100%;padding:8px 10px;background:#fdf8f0;border:1px solid #d4b896;border-radius:4px;color:#4a3728;font-size:13px">
+            <option value="smsbower">SMSBower</option>
+            <option value="hero-sms">Hero-SMS</option>
+          </select>
+          <label>API Key</label><input id="api_key" placeholder="your-sms-api-key">
           <label>代理</label><input id="proxy" placeholder="socks5h://127.0.0.1:10808">
-          <label>国家代码</label><input id="country" value="151">
+          <label>国家/地区 ID（按所选短信平台，多个用逗号分隔）</label><input id="countries" value="151" placeholder="151 或 151,52,6">
           <label>最高价格</label><input id="max_price" placeholder="留空=不限">
           <label>密码</label><input id="password" placeholder="留空=随机">
           <div class="row" style="margin-top:10px">
@@ -2949,7 +2956,7 @@ function pollLog(){
 setInterval(pollLog,800);
 
 function saveConfig(){
-    var d={api_key:G('api_key').value,proxy:G('proxy').value,country:G('country').value,
+    var d={sms_provider:G('sms_provider').value,api_key:G('api_key').value,proxy:G('proxy').value,countries:G('countries').value,
     password:G('password').value,max_price:G('max_price').value,
     sms_timeout:30,code_timeout:30,
     email_provider:G('email_provider').value,
@@ -3078,9 +3085,18 @@ function loadConfig(){
   fetch('/api/config').then(function(r){return r.json()}).then(function(j){
     if(!j.ok)return;
     var c=j.config;
-    if(c.smsbower) G('api_key').value=c.smsbower.api_key||'';
+    // New sms.* config
+    if(c.sms){
+      G('sms_provider').value=c.sms.provider||'smsbower';
+      G('api_key').value=c.sms.api_key||'';
+      G('countries').value=(c.sms.countries||['151']).join(',');
+    } else if(c.smsbower) {
+      // Legacy fallback
+      G('sms_provider').value='smsbower';
+      G('api_key').value=c.smsbower.api_key||'';
+      G('countries').value=c.country||'151';
+    }
     G('proxy').value=c.proxy||'';
-    G('country').value=c.country||'151';
     G('max_price').value=c.max_price||'';
     if(c.register && c.register.password) G('password').value=c.register.password;
     if(c.icloud){G('imap_user').value=c.icloud.user||'';G('imap_pass').value=c.icloud.pass||'';}
