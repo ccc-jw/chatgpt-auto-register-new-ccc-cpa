@@ -9,3 +9,11 @@ backup/
 open_source.zip
 .reasonix/
 *.db
+# Sensitive local credentials / generated outputs
+cookies.json
+*_cookies.json
+register_results*.json
+outlook_pool*.json
+email_pool*.json
+outlook.txt
+outlook_used.txt

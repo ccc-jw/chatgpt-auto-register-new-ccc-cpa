@@ -147,7 +147,7 @@ python auto_register.py -n 5 --country 151 --max-price 0.039
 
 # Web GUI
 python auto_register.py --gui
-# 浏览器打开 http://127.0.0.1:8080
+# 浏览器打开 http://127.0.0.1:7777
 ```
 
 ### Phase 2: OAuth 登录 + 绑邮箱 + 上传 SUB2API
@@ -190,9 +190,9 @@ chatgpt-auto-register/
 ├── test_pipeline.py       # Daily-use entry point
 │
 ├── config.example.json    # Configuration template
-├── cookies.json           # iCloud cookies (gitignored)
+├── cookies.json           # iCloud cookies (sensitive; ensure gitignored)
 ├── requirements.txt       # Python dependencies
-├── register_results.json  # Output (gitignored)
+├── register_results.json  # Output (sensitive; ensure gitignored)
 └── README.md
 ```
 
