@@ -1,6 +1,11 @@
 {
-    "smsbower": {
-        "api_key": "YOUR_API_KEY"
+    "sms": {
+        "provider": "smsbower",
+        "api_key": "YOUR_API_KEY",
+        "countries": ["151", "52", "6"],
+        "service": "dr",
+        "operator": "any",
+        "max_price": ""
     },
     "register": {
         "password": "",
@@ -8,11 +13,7 @@
         "birthdate": "2000-01-01"
     },
     "proxy": "",
-    "country": "151",
-    "service": "dr",
     "code_timeout": 30,
-    "max_price": "",
-
     "phase2": {
         "icloud_cookies": "cookies.json",
         "imap_user": "",

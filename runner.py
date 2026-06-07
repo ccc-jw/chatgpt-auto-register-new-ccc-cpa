@@ -8,7 +8,7 @@ from typing import Optional
 from pathlib import Path
 
 import auto_register as ar
-from smsbower import SmsBower
+from phone_sms_adapter import UnifiedSMS, parse_countries
 
 import db
 
@@ -97,16 +97,26 @@ def _run(user_id: int, target_count: int, sse_q: queue.Queue, stop_ev: threading
     country = config_data.get("country", "") or "151"
     max_price = config_data.get("max_price", "") or ""
     sms_timeout = config_data.get("sms_timeout", 30) or 30
-    smsbower_key = config_data.get("smsbower_key", "") or ""
+    sms_provider = config_data.get("sms_provider", "smsbower") or "smsbower"
+    sms_api_key = config_data.get("sms_api_key", "") or config_data.get("smsbower_key", "") or ""
+    sms_countries = parse_countries(config_data.get("sms_countries", country))
 
-    if not smsbower_key:
-        sse_q.put({"msg": "Please configure SMSBower API key first", "tag": "error", "time": _ts()})
+    sse_q.put({"msg": f"开始注册任务 user_id={user_id} count={target_count} provider={sms_provider} countries={sms_countries}", "tag": "info", "time": _ts()})
+
+    if not sms_api_key:
+        sse_q.put({"msg": "Please configure SMS API key first", "tag": "error", "time": _ts()})
         return
 
-    sms = SmsBower(smsbower_key)
+    sms = UnifiedSMS(provider=sms_provider, api_key=sms_api_key)
     reg_config = {
-        "service": "dr",
-        "country": country,
+        "sms": {
+            "provider": sms_provider,
+            "api_key": sms_api_key,
+            "countries": sms_countries,
+            "service": "dr",
+            "operator": config_data.get("sms_operator", "any") or "any",
+            "max_price": max_price,
+        },
         "register": {"password": "TempPass123!", "name": "A", "birthdate": "2000-01-01"},
         "proxy": proxy,
         "code_timeout": sms_timeout,
@@ -114,9 +124,9 @@ def _run(user_id: int, target_count: int, sse_q: queue.Queue, stop_ev: threading
 
     try:
         bal = sms.balance()
-        sse_q.put({"msg": f"Balance: {bal}", "tag": "info", "time": _ts()})
+        sse_q.put({"msg": f"短信余额: {bal}", "tag": "info", "time": _ts()})
     except Exception as e:
-        sse_q.put({"msg": f"Balance check failed: {e}", "tag": "error", "time": _ts()})
+        sse_q.put({"msg": f"余额检查失败: {e}", "tag": "error", "time": _ts()})
 
     ok_count = 0
     attempt = 0
@@ -167,15 +177,53 @@ def _run(user_id: int, target_count: int, sse_q: queue.Queue, stop_ev: threading
 
         try:
             phone = result.get("phone", "?")
-            status = "ok" if result["ok"] else "fail"
-            db.log_reg(user_id, phone, status, email, result.get("error", ""))
-            db.consume_quota(user_id)
+            final_ok = result.get("final_ok", False)
+            phone_ok = result.get("phone_ok", False)
+            email_bound = result.get("email_bound", False)
+            uploaded = result.get("uploaded", False)
+            status = result.get("status", "register_failed")
+            failure_stage = result.get("failure_stage", "")
+            retryable = result.get("retryable", False)
+            sms_prov = result.get("sms_provider", "")
+            sms_country = result.get("country", "")
 
-            if result["ok"]:
-                ok_count += 1
+            # SSE structured stage event
+            sse_q.put({
+                "stage": "final_ok" if final_ok else ("phone_ok" if phone_ok else "register_failed"),
+                "phone_ok": phone_ok,
+                "email_selected": result.get("email_selected", False),
+                "email_bound": email_bound,
+                "uploaded": uploaded,
+                "final_ok": final_ok,
+                "status": status,
+                "failure_stage": failure_stage,
+                "retryable": retryable,
+                "sms_provider": sms_prov,
+                "country": sms_country,
+                "phone": phone,
+                "email": email,
+                "tag": "success" if final_ok else ("warn" if phone_ok else "error"),
+                "time": _ts(),
+            })
+
+            # Human-readable message
+            if final_ok:
                 sse_q.put({"msg": f"OK: {phone} -> {email}", "tag": "success", "time": _ts()})
+            elif phone_ok:
+                sse_q.put({"msg": f"PHONE_OK: {phone} ({status})", "tag": "warn", "time": _ts()})
+                if retryable:
+                    sse_q.put({"msg": f"可补跑 Phase2 (phone_ok=true, final_ok=false)", "tag": "info", "time": _ts()})
             else:
-                sse_q.put({"msg": f"FAIL: {phone} - {result.get('error','')}", "tag": "error", "time": _ts()})
+                sse_q.put({"msg": f"FAIL: {phone} - {result.get('error','')} ({failure_stage})", "tag": "error", "time": _ts()})
+
+            # Quota deduction: only when phone_ok succeeds
+            if phone_ok:
+                db.consume_quota(user_id)
+
+            db.log_reg(user_id, phone, status, email, result.get("error", ""))
+
+            if final_ok:
+                ok_count += 1
         except Exception as e:
             sse_q.put({"msg": f"Error: {e}", "tag": "error", "time": _ts()})
 

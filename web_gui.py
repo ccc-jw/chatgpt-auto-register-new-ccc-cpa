@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """ChatGPT Auto Register - Web GUI (Flask + SSE)"""
 
 import copy, json, os, queue, sys, threading, time
@@ -12,6 +12,7 @@ from flask import Flask, request, jsonify, Response, send_file
 app = Flask(__name__)
 sys.path.insert(0, str(Path(__file__).parent))
 from smsbower import SmsBower
+from phone_sms_adapter import UnifiedSMS, parse_countries
 import auto_register as ar
 from outlook_mail import (
     OutlookMailClient,
@@ -208,7 +209,7 @@ def api_config():
                 "plus_method", "plus_email", "plus_phone", "plus_pin",
                 "plus_country", "plus_currency"]:
             if k in d:
-                if k == "api_key": cfg["smsbower"]["api_key"] = d[k]
+                if k == "api_key": cfg["sms"]["api_key"] = d[k]
                 elif k in ("code_timeout", "sms_timeout"): cfg[k] = int(d[k]) if d[k] else 30
                 elif k == "password": cfg["register"]["password"] = d[k]
                 elif k in ("proxy", "country", "service", "max_price", "provider"): cfg[k] = d[k]
@@ -241,10 +242,12 @@ def api_config():
 
 @app.route("/api/balance")
 def api_balance():
-    key = _state.get("config", {}).get("smsbower", {}).get("api_key", "")
+    sms_cfg = _state.get("config", {}).get("sms", {})
+    key = sms_cfg.get("api_key", "")
+    provider = sms_cfg.get("provider", "smsbower")
     if not key: return jsonify({"ok": False, "error": "No API key"})
     try:
-        return jsonify({"ok": True, "balance": SmsBower(key).balance()})
+        return jsonify({"ok": True, "balance": UnifiedSMS(provider=provider, api_key=key).balance()})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
 
@@ -1245,10 +1248,12 @@ def _run(config, count, retries, concurrency=1):
     sys.stdout = _LogWriter(_log)
     _state["_phase2_retry"] = False
 
-    key = config.get("smsbower", {}).get("api_key", "")
-    sms = SmsBower(key)
+    sms_cfg = config.get("sms", {"api_key": "", "provider": "smsbower", "countries": ["151"], "service": "dr", "operator": "any", "max_price": ""})
+    key = sms_cfg.get("api_key", "")
+    provider = sms_cfg.get("provider", "smsbower")
+    sms = UnifiedSMS(provider=provider, api_key=key)
     try:
-        _log(f"浣欓: {sms.balance()}", "info")
+        _log(f"短信余额: {sms.balance()}", "info")
     except: pass
 
     results_dir = Path(__file__).parent / "results"
@@ -1313,7 +1318,7 @@ def _run(config, count, retries, concurrency=1):
 
     def _worker(thread_id):
         tag = f"[T{thread_id}]" if is_multi else ""
-        thread_sms = SmsBower(key)
+        thread_sms = UnifiedSMS(provider=provider, api_key=key)
         while True:
             claimed = claim_attempt()
             if not claimed:
@@ -1324,8 +1329,8 @@ def _run(config, count, retries, concurrency=1):
             try:
                 result = ar.register_one(thread_sms, thread_cfg, verbose=True, step_retries=retries,
                                          create_account_max_retries=20,
-                                         max_price=config.get("max_price", ""),
-                                         provider_ids=config.get("provider", ""),
+                                         max_price=sms_cfg.get("max_price", ""),
+                                         no_phase2=config.get("no_phase2", False),
                                          stop_requested=_stop_requested)
             except ar.StopRequested:
                 _log(f"{tag} 宸插仠姝㈢瓑寰呮墜鏈哄彿", "warn", thread_id=thread_id)
@@ -1916,10 +1921,12 @@ def _run(config, count, retries, concurrency=1):
     with _STATE_LOCK:
         _state["_phase2_retry"] = False
 
-    key = run_config.get("smsbower", {}).get("api_key", "")
-    sms = SmsBower(key)
+    sms_cfg = run_config.get("sms", {"api_key": "", "provider": "smsbower", "countries": ["151"], "service": "dr", "operator": "any", "max_price": ""})
+    key = sms_cfg.get("api_key", "")
+    provider = sms_cfg.get("provider", "smsbower")
+    sms = UnifiedSMS(provider=provider, api_key=key)
     try:
-        _log(f"浣欓: {sms.balance()}", "info")
+        _log(f"短信余额: {sms.balance()}", "info")
     except Exception:
         pass
 
@@ -2023,7 +2030,7 @@ def _run(config, count, retries, concurrency=1):
     def _worker(thread_id):
         tag = f"[T{thread_id}]" if is_multi else ""
         tlog = lambda msg, level="info": _log(msg, level, thread_id=thread_id)
-        thread_sms = SmsBower(key)
+        thread_sms = UnifiedSMS(provider=provider, api_key=key)
         log_writer.bind_thread(thread_id)
         try:
             while True:
@@ -2040,8 +2047,8 @@ def _run(config, count, retries, concurrency=1):
                         verbose=True,
                         step_retries=retries,
                         create_account_max_retries=20,
-                        max_price=run_config.get("max_price", ""),
-                        provider_ids=run_config.get("provider", ""),
+                        max_price=sms_cfg.get("max_price", ""),
+                        no_phase2=run_config.get("no_phase2", False),
                         stop_requested=_stop_requested,
                     )
                 except ar.StopRequested:
