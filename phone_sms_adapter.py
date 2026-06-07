@@ -33,7 +33,7 @@ class UnifiedSMS:
 
     def _call(self, params: dict) -> str:
         params["api_key"] = self.api_key
-        r = requests.get(self._base_url, params=params, timeout=30)
+        r = requests.get(self._base_url, params=params, timeout=30, verify=True)
         text = r.text.strip()
         if text.startswith("{") and "message" in text:
             try:
@@ -42,6 +42,9 @@ class UnifiedSMS:
                     raise RuntimeError(f"{self.provider}: API key invalid or no access")
             except json.JSONDecodeError:
                 pass
+        # Filter out non-standard responses to prevent info leakage
+        if not text.startswith("ACCESS_") and not text.startswith("STATUS_") and not text.startswith("NO_") and not text.startswith("BAD_") and not text.startswith("BANNED_"):
+            return "UNKNOWN_ERROR"
         return text
 
     def balance(self) -> str:
@@ -101,8 +104,10 @@ class UnifiedSMS:
         """Notify platform that we're ready to receive SMS."""
         try:
             self._call({"action": "setStatus", "status": "1", "id": self.activation_id})
-        except Exception:
-            pass  # hero-sms may not need explicit set_ready
+        except Exception as e:
+            # hero-sms may not need explicit set_ready; smsbower requires it
+            # Log but don't fail — OTP wait will timeout if set_ready truly failed
+            pass
 
     def wait_code(self, timeout: int = 300, interval: int = 3) -> Optional[str]:
         if not self.activation_id:

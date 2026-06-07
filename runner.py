@@ -159,7 +159,7 @@ def _run(user_id: int, target_count: int, sse_q: queue.Queue, stop_ev: threading
                 result = ar.register_one(
                     sms,
                     reg_config,
-                    verbose=True,
+                    verbose=False,
                     step_retries=2,
                     max_price=max_price,
                     stop_requested=stop_ev.is_set,

@@ -351,9 +351,13 @@ def api_plus_upgrade():
         _log(f"[Plus] GoPay 浠樻 {gopay_phone}...", "info")
 
         def wait_otp(phone, timeout):
-            _log(f"[Plus] 绛夊緟 OTP ({phone}, {timeout}s)...", "warn")
+            _log(f"[Plus] 等待 OTP ({phone}, {timeout}s)...", "warn")
             try:
-                sms = SmsBower(cfg["smsbower"]["api_key"])
+                sms_api_key = cfg.get("sms", {}).get("api_key", "") or cfg.get("smsbower", {}).get("api_key", "")
+                sms_provider = cfg.get("sms", {}).get("provider", "smsbower")
+                if not sms_api_key:
+                    return None
+                sms = UnifiedSMS(provider=sms_provider, api_key=sms_api_key)
                 code = sms.wait_code(timeout=timeout, interval=3)
                 return code
             except Exception:
@@ -1379,10 +1383,12 @@ def _run(config, count, retries, concurrency=1):
             # ---- Debug mode: pause (single-thread only) ----
             if debug_mode:
                 _log("=" * 40, "warn")
-                _log(f"DEBUG - 娉ㄥ唽瀹屾垚锛屽凡鏆傚仠", "warn")
+                _log(f"DEBUG - 注册完成，已暂停", "warn")
                 _log(f"Phone: {result['phone']}", "success")
-                _log(f"Password: {result['password']}", "success")
-                _log(f"Session Token: {result.get('session_token','')}", "success")
+                # Do NOT log password or session_token in debug mode to prevent leakage
+                _log(f"Password: ***redacted***", "warn")
+                _log(f"Session Token: ***redacted***", "warn")
+                _log(f"阶段状态: phone_ok={result.get('phone_ok',False)} final_ok={result.get('final_ok',False)}", "info")
                 _log("=" * 40, "warn")
                 _state["_paused"] = True
                 try:
@@ -2118,10 +2124,12 @@ def _run(config, count, retries, concurrency=1):
 
                 if debug_mode:
                     tlog("=" * 40, "warn")
-                    tlog("DEBUG - 娉ㄥ唽瀹屾垚锛屽凡鏆傚仠", "warn")
+                    tlog("DEBUG - 注册完成，已暂停", "warn")
                     tlog(f"Phone: {result['phone']}", "success")
-                    tlog(f"Password: {result['password']}", "success")
-                    tlog(f"Session Token: {result.get('session_token', '')}", "success")
+                    # Do NOT log password or session_token in debug mode
+                    tlog(f"Password: ***redacted***", "warn")
+                    tlog(f"Session Token: ***redacted***", "warn")
+                    tlog(f"阶段状态: phone_ok={result.get('phone_ok',False)} final_ok={result.get('final_ok',False)}", "info")
                     tlog("=" * 40, "warn")
                     _state["_paused"] = True
                     try:

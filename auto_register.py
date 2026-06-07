@@ -86,6 +86,8 @@ def _get_number_with_retry(
 ) -> Tuple[str, str, str]:
     """Retry getting phone number, rotating through countries on failure. Infinite cycle until success or stop."""
     import itertools
+    if not countries:
+        raise ValueError("countries list is empty — cannot get phone number without a country")
     country_cycle = itertools.cycle(countries)
     attempt = 0
     for country in country_cycle:
@@ -111,11 +113,11 @@ def _get_number_with_retry(
             continue
 
 
-def _fail_result(phone: str, failure_stage: str, error: str, sms_provider: str = "", country: str = "") -> dict:
+def _fail_result(phone: str, failure_stage: str, error: str, sms_provider: str = "", country: str = "", activation_id: str = "") -> dict:
     return {
         "ok": False, "phone": phone, "password": "",
         "name": "", "birthdate": "",
-        "session_token": "", "access_token": "", "activation_id": "",
+        "session_token": "", "access_token": "", "activation_id": activation_id,
         "status_version": 2,
         "phone_ok": False, "account_created": False, "token_ok": False,
         "email_selected": False, "email_bound": False, "uploaded": False,
@@ -281,7 +283,7 @@ def register_one(
             sms.cancel()
             if verbose:
                 print(f"  [5/9] 注册被拒 status={result.get('_status')}")
-            return _fail_result(phone, "register_rejected", f"注册被拒(status={result.get('_status')})", sms_provider, used_country)
+            return _fail_result(phone, "register_rejected", f"注册被拒(status={result.get('_status')})", sms_provider, used_country, aid)
         if verbose:
             print(f"  [5/9] 手机号注册成功 continue_url 已返回")
 
@@ -297,7 +299,7 @@ def register_one(
             sms.cancel()
             if verbose:
                 print(f"  [6/9] OTP 验证码超时 timeout={config['code_timeout']}s")
-            return _fail_result(phone, "otp_timeout", "验证码超时", sms_provider, used_country)
+            return _fail_result(phone, "otp_timeout", "验证码超时", sms_provider, used_country, aid)
 
         if verbose:
             print(f"  [6/9] 收到验证码: {code}")
@@ -310,7 +312,7 @@ def register_one(
             sms.cancel()
             if verbose:
                 print(f"  [7/9] OTP 校验失败 status={result.get('_status')}")
-            return _fail_result(phone, "otp_validation_failed", f"验证码校验失败(status={result.get('_status')})", sms_provider, used_country)
+            return _fail_result(phone, "otp_validation_failed", f"验证码校验失败(status={result.get('_status')})", sms_provider, used_country, aid)
         if verbose:
             print(f"  [7/9] OTP 校验成功")
 
@@ -348,7 +350,7 @@ def register_one(
             sms.cancel()
             if verbose:
                 print(f"  [8/9] 账户资料创建最终失败 (已重试{create_account_max_retries}次)")
-            return _fail_result(phone, "account_creation_failed", f"创建账户失败(已重试{create_account_max_retries}次): {last_create_error[:200]}", sms_provider, used_country)
+            return _fail_result(phone, "account_creation_failed", f"创建账户失败(已重试{create_account_max_retries}次): {last_create_error[:200]}", sms_provider, used_country, aid)
 
         # ── 阶段 5: OAuth 回调 & 获取 Token ──
         if verbose:
@@ -370,12 +372,13 @@ def register_one(
         # Set stage status
         phone_ok = True
         account_created = True
-        token_ok = True
         if no_phase2:
             final_ok = True
             status = "final_ok"
+            token_ok = True
         else:
             status = "phone_ok"
+            token_ok = False  # Will be set to True by Phase2 caller
             retryable = True
 
         if verbose:
@@ -400,7 +403,7 @@ def register_one(
         except Exception: pass
         if verbose:
             print(f"  [异常] 未预期错误: {e}")
-        return _fail_result(phone, "unexpected_error", str(e), sms_provider, used_country)
+        return _fail_result(phone, "unexpected_error", str(e), sms_provider, used_country, aid)
 
 # ============================================================
 # CLI
