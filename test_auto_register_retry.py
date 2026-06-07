@@ -11,6 +11,7 @@ class FakeSms:
         self.ready_called = False
         self.completed = False
         self.cancelled = False
+        self.provider = "smsbower"
 
     def get_number(self, **kwargs):
         self.get_number_calls += 1
@@ -72,8 +73,14 @@ class FakeRegister:
 class AutoRegisterRetryTests(unittest.TestCase):
     def setUp(self):
         self.config = {
-            "service": "dr",
-            "country": "33",
+            "sms": {
+                "provider": "smsbower",
+                "api_key": "test",
+                "countries": ["33"],
+                "service": "dr",
+                "operator": "any",
+                "max_price": "",
+            },
             "register": {
                 "password": "pw123456",
                 "name": "Alice Smith",
@@ -87,13 +94,19 @@ class AutoRegisterRetryTests(unittest.TestCase):
         sms = FakeSms(failures_before_success=3)
 
         with patch.object(ar, "ChatGPTRegister", FakeRegister), patch.object(ar._time, "sleep", return_value=None):
-            result = ar.register_one(sms, self.config, verbose=False)
+            result = ar.register_one(sms, self.config, verbose=False, no_phase2=True)
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["phone"], "+1234567890")
         self.assertEqual(sms.get_number_calls, 4)
         self.assertTrue(sms.ready_called)
         self.assertTrue(sms.completed)
+        # Verify status_version=2 fields
+        self.assertEqual(result["status_version"], 2)
+        self.assertTrue(result["phone_ok"])
+        self.assertTrue(result["token_ok"])
+        self.assertTrue(result["final_ok"])
+        self.assertEqual(result["status"], "final_ok")
 
     def test_phone_retry_can_be_interrupted_by_stop_request(self):
         sms = FakeSms(failures_before_success=999999)
@@ -108,7 +121,7 @@ class AutoRegisterRetryTests(unittest.TestCase):
                 ar._get_number_with_retry(
                     sms,
                     service="dr",
-                    country="33",
+                    countries=["33"],
                     stop_requested=stop_requested,
                     verbose=False,
                 )
