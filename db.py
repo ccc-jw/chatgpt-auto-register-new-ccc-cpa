@@ -225,7 +225,8 @@ def update_user_config(user_id: int, data: dict):
     try:
         fields = []
         values = []
-        for k in ["smsbower_key", "proxy", "country", "max_price", "sms_timeout"]:
+        for k in ["smsbower_key", "proxy", "country", "max_price", "sms_timeout",
+                   "sms_provider", "sms_api_key", "sms_countries", "sms_service", "sms_max_price"]:
             if k in data:
                 fields.append(f"{k} = %s")
                 values.append(data[k])

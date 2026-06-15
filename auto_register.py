@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Tuple
 
 from chatgpt_register import ChatGPTRegister
-from phone_sms_adapter import UnifiedSMS, parse_countries
+from phone_sms_adapter import StopRequested, UnifiedSMS, parse_countries
 
 # ============================================================
 # 随机资料
@@ -57,21 +57,54 @@ def random_password(length: int = 16) -> str:
     chars = string.ascii_letters + string.digits + "!@#$%"
     return "".join(secrets.choice(chars) for _ in range(length))
 
-def _retry_call(fn, max_retries=2, delay=2, label=""):
-    """重试包装器 — 失败自动重试"""
+def _retry_call(fn, max_retries=2, delay=2, label="", stop_requested=None):
+    """重试包装器 — 失败自动重试，期间检查停止信号"""
     for attempt in range(max_retries + 1):
         try:
             return fn()
         except Exception as e:
             if attempt >= max_retries:
                 raise
+            if stop_requested and stop_requested():
+                raise StopRequested("stopped during retry")
             if label:
                 print(f"  [{label}] 失败 ({e})，{delay}s 后重试 ({attempt+1}/{max_retries})...")
-            _time.sleep(delay)
+            # Interruptible sleep — check stop every 0.1s
+            for _ in range(int(delay * 10)):
+                if stop_requested and stop_requested():
+                    raise StopRequested("stopped during retry sleep")
+                _time.sleep(0.1)
 
 
-class StopRequested(RuntimeError):
-    """Raised when an external stop signal interrupts the registration flow."""
+
+class PhoneNumberUnavailable(RuntimeError):
+    """Raised after a country exhausts its phone-number attempts."""
+
+    def __init__(self, provider: str, country: str, attempts: int, last_error: str = ""):
+        self.provider = provider
+        self.country = country
+        self.attempts = attempts
+        self.last_error = last_error
+        message = f"{provider} country={country}: no numbers after {attempts} attempts"
+        if last_error:
+            message = f"{message} ({last_error})"
+        super().__init__(message)
+
+
+def _format_price(price: float) -> str:
+    return f"{price:.6f}".rstrip("0").rstrip(".")
+
+
+def _lower_price_limit(current: str, cheapest_price: float) -> str:
+    if cheapest_price <= 0:
+        return current or ""
+    if current in (None, ""):
+        return _format_price(cheapest_price)
+    try:
+        current_price = float(current)
+    except (TypeError, ValueError):
+        return _format_price(cheapest_price)
+    return _format_price(min(current_price, cheapest_price))
 
 
 def _get_number_with_retry(
@@ -84,33 +117,90 @@ def _get_number_with_retry(
     retry_delay: int = 2,
     stop_requested=None,
 ) -> Tuple[str, str, str]:
-    """Retry getting phone number, rotating through countries on failure. Infinite cycle until success or stop."""
-    import itertools
+    """Retry getting a phone number forever: 100 attempts per country, then rotate."""
     if not countries:
         raise ValueError("countries list is empty — cannot get phone number without a country")
-    country_cycle = itertools.cycle(countries)
-    attempt = 0
-    for country in country_cycle:
-        if stop_requested and stop_requested():
-            raise StopRequested("stopped while waiting for phone number")
-        attempt += 1
+    normalized_countries = [str(c).strip() for c in countries if str(c).strip()]
+    if not normalized_countries:
+        raise ValueError("countries list is empty — cannot get phone number without a country")
+
+    MAX_ATTEMPTS_PER_COUNTRY = 100
+    cheapest_cache = {}
+
+    def cheapest_args_for_country(country: str):
+        if country in cheapest_cache:
+            return cheapest_cache[country]
+
+        country_provider_ids = provider_ids or ""
+        country_max_price = max_price or ""
+        if sms.provider != "smsbower":
+            cheapest_cache[country] = (country_provider_ids, country_max_price)
+            return cheapest_cache[country]
+
         try:
+            cheapest_provider, cheapest_price = sms.get_cheapest_provider(service=service, country=country)
+            if not cheapest_provider or not cheapest_price or cheapest_price <= 0 or cheapest_price >= 999:
+                raise RuntimeError("no valid cheapest provider returned")
+            country_provider_ids = cheapest_provider
+            country_max_price = _lower_price_limit(country_max_price, cheapest_price)
             if verbose:
-                print(f"  [拿手机号] provider={sms.provider} country={country} 尝试 #{attempt}...")
-            aid, phone = sms.get_number(
-                service=service,
-                country=country,
-                provider_ids=provider_ids,
-                max_price=max_price,
-            )
-            return aid, phone, country
+                provider_msg = f" providerIds={country_provider_ids}" if country_provider_ids else ""
+                print(f"  [拿手机号] country={country} 最低价=${_format_price(cheapest_price)}{provider_msg} maxPrice={country_max_price}")
         except Exception as e:
-            if stop_requested and stop_requested():
-                raise StopRequested("stopped while waiting for phone number")
             if verbose:
-                print(f"  [拿手机号] provider={sms.provider} country={country} 失败 ({e})，{retry_delay}s 后尝试下一个国家...")
-            _time.sleep(retry_delay)
+                print(f"  [拿手机号] country={country} 查询最低价失败，跳过当前国家: {e}")
+            return None
+
+        cheapest_cache[country] = (country_provider_ids, country_max_price)
+        return cheapest_cache[country]
+
+    round_no = 0
+    while True:
+        round_no += 1
+        tried_any_country = False
+        for country in normalized_countries:
+            cheapest_args = cheapest_args_for_country(country)
+            if cheapest_args is None:
+                continue
+            tried_any_country = True
+            country_provider_ids, country_max_price = cheapest_args
+            for attempt in range(1, MAX_ATTEMPTS_PER_COUNTRY + 1):
+                if stop_requested and stop_requested():
+                    raise StopRequested("stopped while waiting for phone number")
+                try:
+                    if verbose:
+                        print(f"  [拿手机号] provider={sms.provider} country={country} 尝试 #{attempt}/{MAX_ATTEMPTS_PER_COUNTRY}...")
+                    aid, phone = sms.get_number(
+                        service=service,
+                        country=country,
+                        provider_ids=country_provider_ids,
+                        max_price=country_max_price,
+                    )
+                    return aid, phone, country
+                except Exception as e:
+                    if stop_requested and stop_requested():
+                        raise StopRequested("stopped while waiting for phone number")
+                    if attempt >= MAX_ATTEMPTS_PER_COUNTRY:
+                        if verbose:
+                            print(f"  [拿手机号] country={country} 已失败 {MAX_ATTEMPTS_PER_COUNTRY} 次，切换到下一个国家...")
+                        break
+                    if verbose:
+                        print(f"  [拿手机号] provider={sms.provider} country={country} 失败 ({e})，{retry_delay}s 后继续重试当前国家 ({attempt}/{MAX_ATTEMPTS_PER_COUNTRY})...")
+                    for _ in range(int(retry_delay * 10)):
+                        if stop_requested and stop_requested():
+                            raise StopRequested("stopped while waiting for phone number")
+                        _time.sleep(0.1)
+        if not tried_any_country:
+            if verbose:
+                print(f"  [拿手机号] 所有国家最低价查询均失败，{retry_delay}s 后重新查询...")
+            for _ in range(int(retry_delay * 10)):
+                if stop_requested and stop_requested():
+                    raise StopRequested("stopped while waiting for phone number")
+                _time.sleep(0.1)
+            cheapest_cache.clear()
             continue
+        if verbose:
+            print(f"  [拿手机号] 所有国家已完成第 {round_no} 轮尝试，从第一个国家重新开始...")
 
 
 def _fail_result(phone: str, failure_stage: str, error: str, sms_provider: str = "", country: str = "", activation_id: str = "") -> dict:
@@ -126,18 +216,28 @@ def _fail_result(phone: str, failure_stage: str, error: str, sms_provider: str =
         "sms_provider": sms_provider, "country": country, "error": error,
     }
 
+DEFAULT_SMS_MAX_PRICE = "0.03"
+
+
 # ============================================================
 # 配置
 # ============================================================
 
 def load_config(path: str = None) -> dict:
     config = {
-        "sms": {"provider": "smsbower", "api_key": "", "countries": ["151"], "service": "dr", "operator": "any", "max_price": ""},
+        "sms": {"provider": "smsbower", "api_key": "", "countries": [], "service": "dr", "operator": "any", "max_price": DEFAULT_SMS_MAX_PRICE},
         "register": {"password": "", "name": "A", "birthdate": "2000-01-01"},
         "proxy": "",
-        "country": "151",
+        "country": "",
         "service": "dr",
         "code_timeout": 30,
+        "upload_target": "sub2api",
+        "cpa": {
+            "management_url": "",
+            "api_url": "",
+            "management_key": "",
+            "upload_mode": "auto",
+        },
     }
     candidates = [path, "config.json", str(Path(__file__).parent / "config.json")]
     found = {}
@@ -157,8 +257,8 @@ def load_config(path: str = None) -> dict:
                 # Legacy: smsbower.api_key
                 config["sms"]["api_key"] = found["smsbower"].get("api_key", "")
                 config["sms"]["provider"] = "smsbower"
-                old_country = found.get("country", "151")
-                config["sms"]["countries"] = [str(old_country)]
+                old_country = found.get("country", "")
+                config["sms"]["countries"] = [str(old_country)] if str(old_country).strip() else []
             # Passthrough old keys
             for k in ["proxy", "country", "service", "code_timeout"]:
                 if k in found:
@@ -166,6 +266,19 @@ def load_config(path: str = None) -> dict:
             for k, v in found.items():
                 if k not in {"sms", "smsbower", "register", "proxy", "country", "service", "code_timeout"}:
                     config[k] = v
+
+            upload_target = str(config.get("upload_target") or "sub2api").strip().lower()
+            if upload_target not in {"sub2api", "cpa"}:
+                upload_target = "sub2api"
+            config["upload_target"] = upload_target
+
+            cpa_cfg = dict(config.get("cpa") or {})
+            config["cpa"] = {
+                "management_url": str(cpa_cfg.get("management_url") or ""),
+                "api_url": str(cpa_cfg.get("api_url") or ""),
+                "management_key": str(cpa_cfg.get("management_key") or ""),
+                "upload_mode": str(cpa_cfg.get("upload_mode") or "auto") or "auto",
+            }
             break
     if os.environ.get("SMSBOWER_KEY"):
         config["sms"]["api_key"] = os.environ["SMSBOWER_KEY"]
@@ -175,8 +288,12 @@ def load_config(path: str = None) -> dict:
     # Normalize countries
     if not isinstance(config["sms"].get("countries"), list):
         config["sms"]["countries"] = parse_countries(config["sms"].get("countries"))
+    if not config["sms"]["countries"] and config.get("country"):
+        config["sms"]["countries"] = parse_countries(config.get("country"))
     if not config["sms"]["countries"]:
-        config["sms"]["countries"] = [config.get("country", "151")]
+        raise ValueError("请在配置中填写 sms.countries（多个国家用逗号或数组），不能使用硬编码默认国家")
+    if not str(config["sms"].get("max_price", "")).strip():
+        config["sms"]["max_price"] = DEFAULT_SMS_MAX_PRICE
     return config
 
 # ============================================================
@@ -254,29 +371,29 @@ def register_one(
 
         if verbose:
             print(f"  [1/9] 访问登录页 chatgpt.com/auth/login")
-        _retry_call(lambda: reg.visit(), sr, label="访问首页")
+        _retry_call(lambda: reg.visit(), sr, label="访问首页", stop_requested=stop_requested)
 
         if verbose:
             print(f"  [2/9] 获取 CSRF token")
-        csrf = _retry_call(lambda: reg.get_csrf(), sr, label="CSRF")
+        csrf = _retry_call(lambda: reg.get_csrf(), sr, label="CSRF", stop_requested=stop_requested)
         if verbose:
             print(f"  [2/9] CSRF 获取成功")
 
         if verbose:
             print(f"  [3/9] 发起手机号登录/注册")
-        redirect = _retry_call(lambda: reg.signin(phone, csrf), sr, label="发起登录")
+        redirect = _retry_call(lambda: reg.signin(phone, csrf), sr, label="发起登录", stop_requested=stop_requested)
         if verbose:
             print(f"  [3/9] 登录请求已发送 redirect_url 获取成功")
 
         if verbose:
             print(f"  [4/9] 跳转 auth.openai.com OAuth")
-        _retry_call(lambda: reg.jump_to_auth(redirect), sr, label="OAuth跳转")
+        _retry_call(lambda: reg.jump_to_auth(redirect), sr, label="OAuth跳转", stop_requested=stop_requested)
         if verbose:
             print(f"  [4/9] OAuth 跳转成功")
 
         if verbose:
             print(f"  [5/9] 提交手机号+密码注册")
-        result = _retry_call(lambda: reg.register_user(phone, password), sr, label="注册")
+        result = _retry_call(lambda: reg.register_user(phone, password), sr, label="注册", stop_requested=stop_requested)
 
         continue_url = result.get("continue_url", "")
         if not continue_url:
@@ -290,11 +407,11 @@ def register_one(
         # ── 阶段 3: 发送并接收 OTP ──
         if verbose:
             print(f"  [6/9] 发送手机验证码 OTP")
-        _retry_call(lambda: reg.send_otp(continue_url), sr, label="发送验证码")
+        _retry_call(lambda: reg.send_otp(continue_url), sr, label="发送验证码", stop_requested=stop_requested)
         if verbose:
             print(f"  [6/9] OTP 发送成功 等待平台返回验证码 (timeout={config['code_timeout']}s)")
 
-        code = sms.wait_code(timeout=config["code_timeout"])
+        code = sms.wait_code(timeout=config["code_timeout"], stop_requested=stop_requested)
         if not code:
             sms.cancel()
             if verbose:
@@ -306,7 +423,7 @@ def register_one(
 
         if verbose:
             print(f"  [7/9] 校验 OTP 验证码")
-        result = _retry_call(lambda: reg.validate_otp(code), sr, label="校验验证码")
+        result = _retry_call(lambda: reg.validate_otp(code), sr, label="校验验证码", stop_requested=stop_requested)
         continue_url = result.get("continue_url", "")
         if not continue_url:
             sms.cancel()
@@ -319,7 +436,7 @@ def register_one(
         # ── 阶段 4: 创建账户资料 ──
         if verbose:
             print(f"  [8/9] 访问 about-you 页面建立会话上下文")
-        _retry_call(lambda: reg.visit_about_you(continue_url), sr, label="访问about-you")
+        _retry_call(lambda: reg.visit_about_you(continue_url), sr, label="访问about-you", stop_requested=stop_requested)
         if verbose:
             print(f"  [8/9] about-you 页面访问成功 开始创建账户资料")
 
@@ -344,7 +461,11 @@ def register_one(
                 detail = last_create_error[:200]
                 print(f"  [8/9] 创建账户失败 [{ca_attempt+1}]: {detail}")
             if ca_attempt < create_account_max_retries - 1:
-                _time.sleep(1)
+                # Interruptible sleep — check stop every 0.1s
+                for _ in range(10):
+                    if stop_requested and stop_requested():
+                        raise StopRequested("stopped during account creation")
+                    _time.sleep(0.1)
 
         if not callback_url:
             sms.cancel()
@@ -355,13 +476,13 @@ def register_one(
         # ── 阶段 5: OAuth 回调 & 获取 Token ──
         if verbose:
             print(f"  [9/9] OAuth 回调获取 session token")
-        token = _retry_call(lambda: reg.oauth_callback(callback_url), sr, label="OAuth回调")
+        token = _retry_call(lambda: reg.oauth_callback(callback_url), sr, label="OAuth回调", stop_requested=stop_requested)
         if verbose:
             print(f"  [9/9] session token 获取成功")
 
         if verbose:
             print(f"  [9/9] 获取 access token")
-        access_token = _retry_call(lambda: reg.get_access_token(), sr, label="获取Token")
+        access_token = _retry_call(lambda: reg.get_access_token(), sr, label="获取Token", stop_requested=stop_requested)
         if verbose:
             print(f"  [9/9] access token 获取成功: {bool(access_token)}")
 
@@ -413,7 +534,7 @@ def main():
     parser = argparse.ArgumentParser(description="ChatGPT 自动注册")
     parser.add_argument("--config", "-c", type=str, help="配置文件路径")
     parser.add_argument("--count", "-n", type=int, default=1, help="目标成功数量")
-    parser.add_argument("--country", type=str, help="国家 ID (默认 151=智利)")
+    parser.add_argument("--country", type=str, help="国家 ID（覆盖配置里的 sms.countries）")
     parser.add_argument("--service", type=str, help="服务代码 (默认 dr=OpenAI)")
     parser.add_argument("--provider", type=str, default="", help="指定运营商 ID")
     parser.add_argument("--max-price", type=str, default="", help="最高价格")
@@ -488,15 +609,23 @@ def main():
             phone = result.get("phone", "?")
             token = result.get("session_token", "")
             at = result.get("access_token", "")
-            print(f"  成功: {phone}  名称: {result.get('name','?')}")
+            print(f"  成功: {phone}  名称: {result.get('name','?')} ChatGPT密码: {result.get('password','')}")
             if args.phase2 and args.sub2api_url:
                 try:
                     from phase2_codex import upload_session
-                    upload_session(token, args.bind_email or "", args.sub2api_url,
-                                   args.sub2api_email, args.sub2api_pwd,
-                                   sub2api_proxy_id=args.sub2api_proxy_id,
-                                   group_ids=[args.sub2api_group_id], access_token=at)
-                    print(f"  已上传到 SUB2API")
+                    upload_result = upload_session(token, args.bind_email or "", args.sub2api_url,
+                                                   args.sub2api_email, args.sub2api_pwd,
+                                                   sub2api_proxy_id=args.sub2api_proxy_id,
+                                                   group_ids=[args.sub2api_group_id], access_token=at)
+                    result["upload_target"] = "sub2api"
+                    result["uploaded"] = bool(upload_result.get("uploaded", upload_result.get("ok")))
+                    result["upload_verified"] = bool(upload_result.get("upload_verified", False))
+                    result["sub2api_id"] = upload_result.get("account_id", "")
+                    if upload_result.get("ok") and result["upload_verified"]:
+                        print(f"  已上传到 SUB2API id={result.get('sub2api_id') or '?'}")
+                    else:
+                        result["upload_error"] = upload_result.get("error") or str(upload_result.get("_raw", upload_result))
+                        print(f"  上传失败: {result['upload_error']}")
                 except Exception as e:
                     print(f"  上传失败: {e}")
         else:
@@ -509,8 +638,23 @@ def main():
     raw = Path(args.output)
     output_path = raw.parent / f"{raw.stem}_{ts}{raw.suffix}"
     safe = [dict(r) for r in results if r.get("ok")]
+    for item in safe:
+        if item.get("password"):
+            item["chatgpt_password"] = item.get("password", "")
     output_path.write_text(json.dumps(safe, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    credentials_path = output_path.parent / f"{raw.stem}_credentials_{ts}.jsonl"
+    with credentials_path.open("w", encoding="utf-8") as f:
+        for item in safe:
+            f.write(json.dumps({
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "phone": item.get("phone", ""),
+                "chatgpt_password": item.get("chatgpt_password", ""),
+                "bind_email": item.get("bind_email", ""),
+                "status": item.get("status", ""),
+                "result_file": str(output_path),
+            }, ensure_ascii=False) + "\n")
     print(f"\n已保存 {len(safe)} 条结果到 {output_path}")
+    print(f"凭证索引已保存到 {credentials_path}")
 
 if __name__ == "__main__":
     main()

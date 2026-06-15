@@ -1,3 +1,4 @@
+import base64
 import json
 import tempfile
 import types
@@ -52,6 +53,28 @@ class FakePollingICloudHME(ICloudHME):
 
 
 class ICloudPhase2Tests(unittest.TestCase):
+    @staticmethod
+    def _jwt(claims):
+        def enc(obj):
+            raw = json.dumps(obj, separators=(",", ":")).encode()
+            return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+        return f"{enc({'alg': 'none'})}.{enc(claims)}.sig"
+
+    def test_build_cpa_auth_payload_extracts_account_id_from_id_token(self):
+        id_token = self._jwt({
+            "email": "user@example.com",
+            "https://api.openai.com/auth": {"chatgpt_account_id": "acct-chatgpt-123"},
+        })
+
+        payload = openai_bind_email._build_cpa_auth_payload(
+            email="user@example.com",
+            access_token="at",
+            refresh_token="rt",
+            id_token=id_token,
+        )
+
+        self.assertEqual(payload["account_id"], "acct-chatgpt-123")
+
     def test_icloud_hme_accepts_browser_export_cookie_array(self):
         client = ICloudHME([
             {"name": "X-APPLE-WEBAUTH-HSA-LOGIN", "value": "abc"},
@@ -109,6 +132,42 @@ class ICloudPhase2Tests(unittest.TestCase):
                 loaded = web_gui._load_phase2_icloud_cookies({})
 
         self.assertEqual(loaded, cookies)
+
+    def test_reserve_next_outlook_reuses_account_after_register_failed_status(self):
+        pool_text = (
+            "user1@outlook.com----pw-1----client-1----refresh-1\n"
+            "user2@outlook.com----pw-2----client-2----refresh-2\n"
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            used_path = Path(tmp) / "outlook_used.txt"
+            used_path.write_text(
+                "2026-06-14 10:00:00\tuser1@outlook.com\treserved\n"
+                "2026-06-14 10:01:00\tuser1@outlook.com\tregister_failed\n",
+                encoding="utf-8",
+            )
+
+            account = outlook_mail.reserve_next_outlook(pool_text, str(used_path))
+
+        self.assertEqual(account.email, "user1@outlook.com")
+
+    def test_reserve_next_outlook_skips_latest_reserved_account(self):
+        pool_text = (
+            "user1@outlook.com----pw-1----client-1----refresh-1\n"
+            "user2@outlook.com----pw-2----client-2----refresh-2\n"
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            used_path = Path(tmp) / "outlook_used.txt"
+            used_path.write_text(
+                "2026-06-14 10:00:00\tuser1@outlook.com\tregister_failed\n"
+                "2026-06-14 10:01:00\tuser1@outlook.com\treserved\n",
+                encoding="utf-8",
+            )
+
+            account = outlook_mail.reserve_next_outlook(pool_text, str(used_path))
+
+        self.assertEqual(account.email, "user2@outlook.com")
 
     def test_reserve_next_outlook_accepts_inline_pool_content(self):
         pool_text = (
@@ -419,6 +478,13 @@ class ICloudPhase2Tests(unittest.TestCase):
 
 
 class Phase2WrapperTests(unittest.TestCase):
+    @staticmethod
+    def _jwt(claims):
+        def enc(obj):
+            raw = json.dumps(obj, separators=(",", ":")).encode()
+            return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+        return f"{enc({'alg': 'none'})}.{enc(claims)}.sig"
+
     def test_phase2_bind_and_upload_does_not_pass_mailmanage_kwargs(self):
         captured = {}
 
@@ -531,6 +597,269 @@ class Phase2WrapperTests(unittest.TestCase):
         self.assertEqual(oauth_info["auth_url"], auth_url)
         self.assertEqual(oauth_info["session_id"], "sid-123")
         self.assertEqual(oauth_info["state"], "state-123")
+
+    def test_get_cpa_oauth_url_returns_url_and_state(self):
+        resp = mock.Mock(status_code=200, text='{"status":"ok"}')
+        resp.json.return_value = {
+            "status": "ok",
+            "state": "cpa-state-123",
+            "url": "https://auth.openai.com/oauth/authorize?state=cpa-state-123",
+        }
+
+        with mock.patch("requests.get", return_value=resp) as get_mock:
+            info = phase2_codex.get_cpa_oauth_url("https://cpa.example.com/", "mgmt-key")
+
+        get_mock.assert_called_once_with(
+            "https://cpa.example.com/v0/management/codex-auth-url",
+            headers={"X-Management-Key": "mgmt-key"},
+            timeout=30,
+        )
+        self.assertEqual(info["auth_url"], "https://auth.openai.com/oauth/authorize?state=cpa-state-123")
+        self.assertEqual(info["state"], "cpa-state-123")
+
+    def test_complete_cpa_oauth_callback_posts_provider_code_and_state(self):
+        resp = mock.Mock(status_code=200, text='{"status":"ok"}')
+        resp.json.return_value = {"status": "ok", "message": "imported"}
+
+        with mock.patch("requests.post", return_value=resp) as post_mock:
+            result = phase2_codex.complete_cpa_oauth_callback(
+                "https://cpa.example.com",
+                "mgmt-key",
+                "code-123",
+                "state-123",
+            )
+
+        post_mock.assert_called_once_with(
+            "https://cpa.example.com/v0/management/oauth-callback",
+            json={"provider": "codex", "code": "code-123", "state": "state-123"},
+            headers={"X-Management-Key": "mgmt-key"},
+            timeout=120,
+        )
+        self.assertTrue(result["ok"])
+
+    def test_upload_cpa_auth_file_posts_codex_payload(self):
+        resp = mock.Mock(status_code=200, text='{"status":"ok"}')
+        resp.json.return_value = {"status": "ok", "filename": "codex-user.json"}
+
+        with mock.patch("requests.post", return_value=resp) as post_mock:
+            result = phase2_codex.upload_cpa_auth_file(
+                "https://cpa.example.com",
+                "mgmt-key",
+                {"type": "codex", "email": "user@example.com", "access_token": "at"},
+                "codex-user.json",
+            )
+
+        post_mock.assert_called_once_with(
+            "https://cpa.example.com/v0/management/auth-files",
+            json={"filename": "codex-user.json", "content": {"type": "codex", "email": "user@example.com", "access_token": "at"}},
+            headers={"X-Management-Key": "mgmt-key"},
+            timeout=60,
+        )
+        self.assertTrue(result["ok"])
+
+    def test_phase2_codex_codex_login_forwards_upload_target_and_cpa_config(self):
+        captured = {}
+
+        def fake_run_second_half(**kwargs):
+            captured.update(kwargs)
+            return {"ok": True, "uploaded": True, "upload_target": "cpa"}
+
+        with mock.patch("openai_bind_email.run_second_half", side_effect=fake_run_second_half):
+            result = phase2_codex.codex_login(
+                session_token="session-1",
+                phone="+15551234567",
+                password="pw-123",
+                bind_email="target@outlook.com",
+                oauth_url={"auth_url": "https://auth.openai.com/oauth/authorize?state=cpa-state", "state": "cpa-state"},
+                icloud_cookies={},
+                upload_target="cpa",
+                cpa_api_url="https://cpa.example.com",
+                cpa_management_key="mgmt-key",
+                cpa_upload_mode="auto",
+                verbose=False,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(captured["upload_target"], "cpa")
+        self.assertEqual(captured["cpa_api_url"], "https://cpa.example.com")
+        self.assertEqual(captured["cpa_management_key"], "mgmt-key")
+        self.assertEqual(captured["cpa_oauth_state"], "cpa-state")
+
+    def test_run_second_half_cpa_callback_success_returns_uploaded(self):
+        with mock.patch("openai_bind_email.OAuthSecondHalf") as flow_cls:
+            flow = flow_cls.return_value
+            flow.initiate_oauth.return_value = (True, "", "")
+            flow.submit_phone.return_value = {"page": {"type": "consent"}}
+            flow.verify_password.return_value = {"page": {"type": "consent"}}
+            flow.get_session_dump.return_value = {"client_auth_session": {"workspaces": [{"id": "ws-1"}]}}
+            flow.selected_workspace_id = "ws-1"
+            flow.select_workspace.return_value = {"page": {"type": "done"}, "continue_url": "https://auth.openai.com/continue"}
+            flow.follow_continue_until_code.return_value = "code-123"
+            with mock.patch("phase2_codex.complete_cpa_oauth_callback", return_value={"ok": True, "data": {"status": "ok"}}):
+                with mock.patch("phase2_codex.ensure_cpa_auth_file_account_id", return_value={"ok": True}) as patch_mock:
+                    result = openai_bind_email.run_second_half(
+                        oauth_url="https://auth.openai.com/oauth/authorize?client_id=cid&state=cpa-state",
+                        phone="+15551234567",
+                        password="pw",
+                        icloud_email="user@example.com",
+                        icloud_cookies={},
+                        upload_target="cpa",
+                        cpa_api_url="https://cpa.example.com",
+                        cpa_management_key="mgmt-key",
+                        cpa_oauth_state="cpa-state",
+                        verbose=False,
+                    )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["uploaded"])
+        self.assertEqual(result["upload_target"], "cpa")
+        patch_mock.assert_called_once_with("https://cpa.example.com", "mgmt-key", "codex-user@example.com.json", "", "user@example.com")
+
+    def test_run_second_half_cpa_callback_failure_falls_back_to_auth_file(self):
+        id_token = self._jwt({
+            "email": "user@example.com",
+            "https://api.openai.com/auth": {"chatgpt_account_id": "acct-chatgpt-123"},
+        })
+        with mock.patch("openai_bind_email.OAuthSecondHalf") as flow_cls:
+            flow = flow_cls.return_value
+            flow.initiate_oauth.return_value = (True, "", "")
+            flow.submit_phone.return_value = {"page": {"type": "consent"}}
+            flow.verify_password.return_value = {"page": {"type": "consent"}}
+            flow.get_session_dump.return_value = {"client_auth_session": {"workspaces": [{"id": "ws-1"}]}}
+            flow.select_workspace.return_value = {"page": {"type": "done"}, "continue_url": "https://auth.openai.com/continue"}
+            flow.follow_continue_until_code.return_value = "code-123"
+            with mock.patch("phase2_codex.complete_cpa_oauth_callback", return_value={"ok": False, "data": {"error": "bad"}}):
+                with mock.patch("phase2_codex.upload_cpa_auth_file", return_value={"ok": True, "filename": "codex-user.json"}) as upload_mock:
+                    result = openai_bind_email.run_second_half(
+                        oauth_url="https://auth.openai.com/oauth/authorize?client_id=cid&state=cpa-state",
+                        phone="+15551234567",
+                        password="pw",
+                        icloud_email="user@example.com",
+                        icloud_cookies={},
+                        upload_target="cpa",
+                        cpa_api_url="https://cpa.example.com",
+                        cpa_management_key="mgmt-key",
+                        cpa_oauth_state="cpa-state",
+                        access_token="at",
+                        refresh_token="rt",
+                        id_token=id_token,
+                        verbose=False,
+                    )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["uploaded"])
+        self.assertEqual(result["upload_method"], "cpa_auth_file")
+        self.assertEqual(upload_mock.call_args.args[2]["account_id"], "acct-chatgpt-123")
+
+    def test_run_second_half_cpa_fallback_without_account_id_saves_failed_upload(self):
+        with mock.patch("openai_bind_email.OAuthSecondHalf") as flow_cls:
+            flow = flow_cls.return_value
+            flow.initiate_oauth.return_value = (True, "", "")
+            flow.submit_phone.return_value = {"page": {"type": "consent"}}
+            flow.verify_password.return_value = {"page": {"type": "consent"}}
+            flow.get_session_dump.return_value = {"client_auth_session": {"workspaces": [{"id": "ws-1"}]}}
+            flow.select_workspace.return_value = {"page": {"type": "done"}, "continue_url": "https://auth.openai.com/continue"}
+            flow.follow_continue_until_code.return_value = "code-123"
+            with mock.patch("phase2_codex.complete_cpa_oauth_callback", return_value={"ok": False, "data": {"error": "bad"}}):
+                with mock.patch("phase2_codex.upload_cpa_auth_file") as upload_mock:
+                    with mock.patch("failed_uploads.save_failed_upload", return_value="failed_uploads/missing-account.json") as save_mock:
+                        result = openai_bind_email.run_second_half(
+                            oauth_url="https://auth.openai.com/oauth/authorize?client_id=cid&state=cpa-state",
+                            phone="+15551234567",
+                            password="pw",
+                            icloud_email="user@example.com",
+                            icloud_cookies={},
+                            upload_target="cpa",
+                            cpa_api_url="https://cpa.example.com",
+                            cpa_management_key="mgmt-key",
+                            cpa_oauth_state="cpa-state",
+                            access_token="at",
+                            refresh_token="rt",
+                            verbose=False,
+                        )
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["uploaded"])
+        self.assertEqual(result["failed_upload_file"], "failed_uploads/missing-account.json")
+        self.assertIn("account_id", result["upload_error"])
+        upload_mock.assert_not_called()
+        self.assertNotIn("account_id", save_mock.call_args.args[0])
+
+    def test_run_second_half_cpa_final_failure_saves_failed_upload(self):
+        with mock.patch("openai_bind_email.OAuthSecondHalf") as flow_cls:
+            flow = flow_cls.return_value
+            flow.initiate_oauth.return_value = (True, "", "")
+            flow.submit_phone.return_value = {"page": {"type": "consent"}}
+            flow.verify_password.return_value = {"page": {"type": "consent"}}
+            flow.get_session_dump.return_value = {"client_auth_session": {"workspaces": [{"id": "ws-1"}]}}
+            flow.select_workspace.return_value = {"page": {"type": "done"}, "continue_url": "https://auth.openai.com/continue"}
+            flow.follow_continue_until_code.return_value = "code-123"
+            with mock.patch("phase2_codex.complete_cpa_oauth_callback", return_value={"ok": False, "data": {"error": "bad"}}):
+                with mock.patch("phase2_codex.upload_cpa_auth_file", return_value={"ok": False, "data": {"error": "bad fallback"}}):
+                    with mock.patch("failed_uploads.save_failed_upload", return_value="failed_uploads/fail.json") as save_mock:
+                        result = openai_bind_email.run_second_half(
+                            oauth_url="https://auth.openai.com/oauth/authorize?client_id=cid&state=cpa-state",
+                            phone="+15551234567",
+                            password="pw",
+                            icloud_email="user@example.com",
+                            icloud_cookies={},
+                            upload_target="cpa",
+                            cpa_api_url="https://cpa.example.com",
+                            cpa_management_key="mgmt-key",
+                            cpa_oauth_state="cpa-state",
+                            access_token="at",
+                            account_id="acct-chatgpt-123",
+                            verbose=False,
+                        )
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["uploaded"])
+        self.assertEqual(result["failed_upload_file"], "failed_uploads/fail.json")
+        saved_record = save_mock.call_args.args[0]
+        self.assertEqual(saved_record["phone"], "+15551234567")
+        self.assertEqual(saved_record["access_token"], "at")
+        self.assertNotIn("cpa_management_key", saved_record)
+
+    def test_run_second_half_sub2api_upload_failure_saves_failed_upload(self):
+        with mock.patch("openai_bind_email.OAuthSecondHalf") as flow_cls:
+            flow = flow_cls.return_value
+            flow.initiate_oauth.return_value = (True, "", "")
+            flow.submit_phone.return_value = {"page": {"type": "consent"}}
+            flow.verify_password.return_value = {"page": {"type": "consent"}}
+            flow.get_session_dump.return_value = {"client_auth_session": {"workspaces": [{"id": "ws-1"}]}}
+            flow.select_workspace.return_value = {"page": {"type": "done"}, "continue_url": "https://auth.openai.com/continue"}
+            flow.follow_continue_until_code.return_value = "code-123"
+
+            login_resp = mock.Mock(status_code=200)
+            login_resp.json.return_value = {"code": 0, "data": {"access_token": "admin-token"}}
+            exchange_resp = mock.Mock(status_code=500, text="server error")
+
+            with mock.patch("requests.post", side_effect=[login_resp, exchange_resp]):
+                with mock.patch("failed_uploads.save_failed_upload", return_value="failed_uploads/sub.json") as save_mock:
+                    result = openai_bind_email.run_second_half(
+                        oauth_url="https://auth.openai.com/oauth/authorize?client_id=cid&state=sub-state",
+                        phone="+15551234567",
+                        password="pw",
+                        icloud_email="user@example.com",
+                        icloud_cookies={},
+                        sub2api_url="https://sub2api.example.com",
+                        sub2api_email="admin@example.com",
+                        sub2api_password="secret",
+                        sub2api_session_id="sid-123",
+                        sub2api_state="sub-state",
+                        session_token="session-token",
+                        access_token="access-token",
+                        verbose=False,
+                    )
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["uploaded"])
+        self.assertEqual(result["failed_upload_file"], "failed_uploads/sub.json")
+        saved_record = save_mock.call_args.args[0]
+        self.assertEqual(saved_record["upload_target"], "sub2api")
+        self.assertEqual(saved_record["session_token"], "session-token")
+        self.assertEqual(saved_record["access_token"], "access-token")
+        self.assertNotIn("sub2api_password", saved_record)
 
 
 class OutlookMailFallbackTests(unittest.TestCase):

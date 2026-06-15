@@ -1,27 +1,63 @@
 {
-    "sms": {
-        "provider": "smsbower",
-        "api_key": "YOUR_API_KEY",
-        "countries": ["151", "52", "6"],
-        "service": "dr",
-        "operator": "any",
-        "max_price": ""
-    },
-    "register": {
-        "password": "",
-        "name": "A",
-        "birthdate": "2000-01-01"
-    },
-    "proxy": "",
-    "code_timeout": 30,
-    "phase2": {
-        "icloud_cookies": "cookies.json",
-        "imap_user": "",
-        "imap_pass": "",
-        "sub2api_url": "",
-        "sub2api_email": "",
-        "sub2api_password": "",
-        "sub2api_group": "CHATGPT",
-        "bind_email": ""
-    }
+  "sms": {
+    "provider": "hero-sms",
+    "api_key": "YOUR_SMS_API_KEY",
+    "countries": [
+      "4",
+      "16"
+    ],
+    "service": "dr",
+    "operator": "any",
+    "max_price": "0.03"
+  },
+  "register": {
+    "password": "",
+    "name": "A",
+    "birthdate": "2000-01-01"
+  },
+  "proxy": "http://127.0.0.1:7890",
+  "country": "",
+  "service": "dr",
+  "code_timeout": 30,
+  "sms_timeout": 30,
+  "icloud": {
+    "user": "YOUR_ICLOUD_EMAIL",
+    "pass": "YOUR_ICLOUD_APP_PASSWORD"
+  },
+  "sub2api": {
+    "url": "https://your-sub2api.example.com",
+    "email": "admin@example.com",
+    "pwd": "YOUR_SUB2API_PASSWORD",
+    "group": "CHATGPT"
+  },
+  "upload_target": "sub2api",
+  "cpa": {
+    "management_url": "http://your-cpa-host:18317",
+    "api_url": "http://your-cpa-host:8317",
+    "management_key": "",
+    "upload_mode": "auto"
+  },
+  "bind_email": "",
+  "icloud_cookies": "",
+  "email_provider": "outlook",
+  "mailmanage": {
+    "api_key": "",
+    "category": "safe",
+    "keyword": "gpt"
+  },
+  "outlook_pool": "email@example.com----password----client_id----refresh_token",
+  "debug_mode": false,
+  "no_phase2": false,
+  "phase2_auto_skip": false,
+  "plus_method": "gopay",
+  "plus_email": "",
+  "plus_phone": "",
+  "plus_pin": "",
+  "plus_country": "ID",
+  "plus_currency": "IDR",
+  "sms_provider": "hero-sms",
+  "sms_api_key": "YOUR_SMS_API_KEY",
+  "sms_countries": "4,16",
+  "sms_service": "dr",
+  "sms_max_price": "0.03"
 }

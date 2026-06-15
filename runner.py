@@ -94,12 +94,17 @@ def _ts():
 def _run(user_id: int, target_count: int, sse_q: queue.Queue, stop_ev: threading.Event):
     config_data = db.get_user_config(user_id)
     proxy = config_data.get("proxy", "") or "socks5h://127.0.0.1:10808"
-    country = config_data.get("country", "") or "151"
-    max_price = config_data.get("max_price", "") or ""
-    sms_timeout = config_data.get("sms_timeout", 30) or 30
     sms_provider = config_data.get("sms_provider", "smsbower") or "smsbower"
     sms_api_key = config_data.get("sms_api_key", "") or config_data.get("smsbower_key", "") or ""
-    sms_countries = parse_countries(config_data.get("sms_countries", country))
+    sms_timeout = config_data.get("sms_timeout", 30) or 30
+    # 优先读新字段，回退到旧字段兼容；国家必须来自用户配置
+    sms_countries_raw = config_data.get("sms_countries", "") or config_data.get("country", "")
+    sms_countries = parse_countries(sms_countries_raw)
+    sms_max_price = config_data.get("sms_max_price", "") or config_data.get("max_price", "") or ar.DEFAULT_SMS_MAX_PRICE
+
+    if not sms_countries:
+        sse_q.put({"msg": "请先在配置中填写短信国家/地区 ID（多个用逗号分隔）", "tag": "error", "time": _ts()})
+        return
 
     sse_q.put({"msg": f"开始注册任务 user_id={user_id} count={target_count} provider={sms_provider} countries={sms_countries}", "tag": "info", "time": _ts()})
 
@@ -115,7 +120,7 @@ def _run(user_id: int, target_count: int, sse_q: queue.Queue, stop_ev: threading
             "countries": sms_countries,
             "service": "dr",
             "operator": config_data.get("sms_operator", "any") or "any",
-            "max_price": max_price,
+            "max_price": sms_max_price,
         },
         "register": {"password": "TempPass123!", "name": "A", "birthdate": "2000-01-01"},
         "proxy": proxy,
@@ -130,6 +135,7 @@ def _run(user_id: int, target_count: int, sse_q: queue.Queue, stop_ev: threading
 
     ok_count = 0
     attempt = 0
+    country_cursor = 0
     max_attempts = target_count * 15
 
     while ok_count < target_count and attempt < max_attempts and not stop_ev.is_set():
@@ -155,13 +161,16 @@ def _run(user_id: int, target_count: int, sse_q: queue.Queue, stop_ev: threading
             # Redirect print output to SSE
             import io, contextlib
             buf = io.StringIO()
+            ordered_countries = sms_countries[country_cursor:] + sms_countries[:country_cursor]
+            country_cursor = (country_cursor + 1) % len(sms_countries)
+            reg_config["sms"]["countries"] = ordered_countries
             with contextlib.redirect_stdout(buf):
                 result = ar.register_one(
                     sms,
                     reg_config,
                     verbose=False,
                     step_retries=2,
-                    max_price=max_price,
+                    max_price=sms_max_price,
                     stop_requested=stop_ev.is_set,
                 )
             for line in buf.getvalue().split("\n"):
@@ -224,6 +233,8 @@ def _run(user_id: int, target_count: int, sse_q: queue.Queue, stop_ev: threading
 
             if final_ok:
                 ok_count += 1
+            else:
+                pass
         except Exception as e:
             sse_q.put({"msg": f"Error: {e}", "tag": "error", "time": _ts()})
 

@@ -10,6 +10,10 @@ from typing import Optional, Tuple, List
 import requests
 
 
+class StopRequested(RuntimeError):
+    """Raised when an external stop signal interrupts SMS polling."""
+
+
 class UnifiedSMS:
     """
     Exposes the same interface that auto_register.py expects:
@@ -31,9 +35,9 @@ class UnifiedSMS:
             else "https://hero-sms.com/stubs/handler_api.php"
         )
 
-    def _call(self, params: dict) -> str:
+    def _call(self, params: dict, timeout: int = 30) -> str:
         params["api_key"] = self.api_key
-        r = requests.get(self._base_url, params=params, timeout=30, verify=True)
+        r = requests.get(self._base_url, params=params, timeout=timeout, verify=True)
         text = r.text.strip()
         if text.startswith("{") and "message" in text:
             try:
@@ -42,9 +46,6 @@ class UnifiedSMS:
                     raise RuntimeError(f"{self.provider}: API key invalid or no access")
             except json.JSONDecodeError:
                 pass
-        # Filter out non-standard responses to prevent info leakage
-        if not text.startswith("ACCESS_") and not text.startswith("STATUS_") and not text.startswith("NO_") and not text.startswith("BAD_") and not text.startswith("BANNED_"):
-            return "UNKNOWN_ERROR"
         return text
 
     def balance(self) -> str:
@@ -87,7 +88,6 @@ class UnifiedSMS:
                 params["operator"] = self.operator
             if max_price:
                 params["maxPrice"] = max_price
-                params["fixedPrice"] = "true"
         resp = self._call(params)
         if resp.startswith("ACCESS_NUMBER:"):
             parts = resp.split(":")
@@ -109,15 +109,21 @@ class UnifiedSMS:
             # Log but don't fail — OTP wait will timeout if set_ready truly failed
             pass
 
-    def wait_code(self, timeout: int = 300, interval: int = 3) -> Optional[str]:
+    def wait_code(self, timeout: int = 300, interval: int = 3, stop_requested=None) -> Optional[str]:
         if not self.activation_id:
             raise RuntimeError("No active activation")
         started = time.time()
         while time.time() - started < timeout:
-            resp = self._call({"action": "getStatus", "id": self.activation_id})
+            if stop_requested and stop_requested():
+                self.cancel()
+                raise StopRequested("stopped while waiting for SMS code")
+            try:
+                resp = self._call({"action": "getStatus", "id": self.activation_id}, timeout=30)
+            except StopRequested:
+                self.cancel()
+                raise
             if resp.startswith("STATUS_OK:"):
                 code = resp.split(":", 1)[1].strip()
-                # For hero-sms, extract 4-8 digit code if the response contains extra text
                 if self.provider == "hero-sms" and len(code) > 8:
                     m = re.search(r"\b(\d{4,8})\b", code)
                     if m:
@@ -125,8 +131,13 @@ class UnifiedSMS:
                 return code
             elif resp == "STATUS_CANCEL":
                 raise RuntimeError("Activation cancelled (may have timed out)")
-            # STATUS_WAIT_CODE, STATUS_WAIT_RETRY, STATUS_WAIT_RESEND → continue waiting
-            time.sleep(interval)
+            # Interruptible sleep
+            sleep_start = time.time()
+            while time.time() - sleep_start < interval:
+                if stop_requested and stop_requested():
+                    self.cancel()
+                    raise StopRequested("stopped during SMS wait sleep")
+                time.sleep(min(0.5, interval - (time.time() - sleep_start)))
         return None
 
     def complete(self):
@@ -137,6 +148,38 @@ class UnifiedSMS:
             self._call({"action": "setStatus", "status": "8", "id": self.activation_id})
         except Exception:
             pass
+
+    def get_sorted_countries_by_price(self, countries: List[str], service: str = "dr") -> List[dict]:
+        """Query price for each country and return sorted by cheapest price first.
+        Returns list of [{"country": "4", "price": 0.025}, ...] sorted ascending.
+        Countries that fail to query are silently skipped.
+        Falls back to original order if no prices can be fetched.
+        """
+        priced = []
+        for c in countries:
+            try:
+                if self.provider == "smsbower":
+                    _, price = self.get_cheapest_provider(service=service, country=c)
+                    if price < 999.0:
+                        priced.append({"country": c, "price": price})
+                elif self.provider == "hero-sms":
+                    r = requests.get(
+                        self._base_url,
+                        params={"api_key": self.api_key, "action": "getPrices", "service": service, "country": c},
+                        timeout=15,
+                    )
+                    data = r.json()
+                    cost = data.get(c, {}).get(service, {}).get("cost")
+                    if cost is not None:
+                        priced.append({"country": c, "price": float(cost)})
+            except Exception:
+                continue
+
+        if not priced:
+            return [{"country": c, "price": 0.0} for c in countries]
+
+        priced.sort(key=lambda x: x["price"])
+        return priced
 
 
 def parse_countries(value) -> List[str]:

@@ -24,6 +24,12 @@ from outlook_manager import _read_used as _read_outlook_used
 
 _STATE_LOCK = threading.RLock()
 
+# ── File logging: one file per server start ──
+_log_dir = Path(__file__).parent / "logs"
+_log_dir.mkdir(exist_ok=True)
+_log_file = _log_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+_log_file_lock = threading.Lock()
+
 
 def _bounded_int(value, default=1, minimum=1, maximum=99):
     try:
@@ -59,7 +65,7 @@ _state = {
     "_code_waiting": {},
 }
 
-# 鈹€鈹€ 閭鍘婚噸 鈹€鈹€
+# ── 邮箱去重 ──
 def _ensure_stats():
     stats = _state.get("stats")
     if not isinstance(stats, dict):
@@ -81,16 +87,20 @@ def _reset_current_stats():
         stats["current_fail"] = 0
 
 
-def _record_result(result: dict):
+def _record_stat(success: bool):
     with _STATE_LOCK:
-        _state["results"].append(result)
         stats = _ensure_stats()
-        if result.get("ok"):
+        if success:
             stats["current_success"] += 1
             stats["total_success"] += 1
         else:
             stats["current_fail"] += 1
             stats["total_fail"] += 1
+
+
+def _record_result(result: dict):
+    with _STATE_LOCK:
+        _state["results"].append(result)
 
 
 def _status_payload():
@@ -192,6 +202,15 @@ def _log(msg, tag="info", thread_id=None):
         _state["log_lines"].append(item)
         if len(_state["log_lines"]) > 2000:
             _state["log_lines"] = _state["log_lines"][-1500:]
+    # Write to log file
+    tid = f"[T{thread_id}] " if thread_id is not None else ""
+    line = f"{ts} {tid}{msg}"
+    with _log_file_lock:
+        try:
+            with open(_log_file, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
 @app.route("/")
 def index():
     return Response(_HTML, mimetype="text/html; charset=utf-8")
@@ -201,20 +220,23 @@ def api_config():
     if request.method == "POST":
         d = request.json or {}
         cfg = ar.load_config()
-        for k in ["sms_provider", "api_key", "proxy", "countries", "service", "password", "max_price", "code_timeout",
+        for k in ["sms_provider", "api_key", "countries", "service", "password", "max_price", "code_timeout",
                    "sms_timeout", "imap_user", "imap_pass", "sub2api_url", "sub2api_email",
                    "sub2api_pwd", "sub2api_group", "sub2api_proxy_id", "bind_email", "icloud_cookies",
                 "email_provider", "mailmanage_key", "mailmanage_category", "mailmanage_keyword", "outlook_pool",
-                "debug_mode", "no_phase2", "phase2_auto_skip",
+                "debug_mode", "no_phase2", "phase2_auto_skip", "sms_sort_by_price",
                 "plus_method", "plus_email", "plus_phone", "plus_pin",
-                "plus_country", "plus_currency"]:
+                "plus_country", "plus_currency", "proxy",
+                "upload_target", "cpa_management_url", "cpa_api_url", "cpa_management_key", "cpa_upload_mode"]:
             if k in d:
                 if k == "sms_provider": cfg["sms"]["provider"] = d[k]
                 elif k == "api_key": cfg["sms"]["api_key"] = d[k]
                 elif k == "countries": cfg["sms"]["countries"] = [c.strip() for c in d[k].split(",") if c.strip()]
                 elif k in ("code_timeout", "sms_timeout"): cfg[k] = int(d[k]) if d[k] else 30
                 elif k == "password": cfg["register"]["password"] = d[k]
-                elif k in ("proxy", "service", "max_price"): cfg["sms"][k] = d[k]
+                elif k == "service": cfg["sms"][k] = d[k]
+                elif k == "max_price": cfg["sms"]["max_price"] = str(d[k]).strip() or ar.DEFAULT_SMS_MAX_PRICE
+                elif k == "proxy": cfg["proxy"] = d[k]
                 elif k == "imap_user": cfg["icloud"] = cfg.get("icloud", {}); cfg["icloud"]["user"] = d[k]
                 elif k == "imap_pass": cfg["icloud"] = cfg.get("icloud", {}); cfg["icloud"]["pass"] = d[k]
                 elif k == "sub2api_url": cfg["sub2api"] = cfg.get("sub2api", {}); cfg["sub2api"]["url"] = d[k]
@@ -234,7 +256,35 @@ def api_config():
                 elif k == "debug_mode": cfg["debug_mode"] = d[k] == "1" or d[k] is True
                 elif k == "no_phase2": cfg["no_phase2"] = d[k] == "1" or d[k] is True
                 elif k == "phase2_auto_skip": cfg["phase2_auto_skip"] = d[k] == "1" or d[k] is True
+                elif k == "sms_sort_by_price": cfg["sms_sort_by_price"] = d[k] == "1" or d[k] is True
+                elif k == "upload_target":
+                    target = str(d[k] or "sub2api").lower()
+                    cfg["upload_target"] = target if target in ("sub2api", "cpa") else "sub2api"
+                elif k == "cpa_management_url": cfg["cpa"] = cfg.get("cpa", {}); cfg["cpa"]["management_url"] = d[k]
+                elif k == "cpa_api_url": cfg["cpa"] = cfg.get("cpa", {}); cfg["cpa"]["api_url"] = d[k]
+                elif k == "cpa_management_key": cfg["cpa"] = cfg.get("cpa", {}); cfg["cpa"]["management_key"] = d[k]
+                elif k == "cpa_upload_mode": cfg["cpa"] = cfg.get("cpa", {}); cfg["cpa"]["upload_mode"] = d[k] or "auto"
+        if not str(cfg["sms"].get("max_price", "")).strip():
+            cfg["sms"]["max_price"] = ar.DEFAULT_SMS_MAX_PRICE
+        # Also write to legacy fields for runner.py backward compatibility
+        cfg["sms_provider"] = cfg["sms"].get("provider", "smsbower")
+        cfg["sms_api_key"] = cfg["sms"].get("api_key", "")
+        cfg["sms_countries"] = ",".join(cfg["sms"].get("countries", []))
+        cfg["sms_service"] = cfg["sms"].get("service", "dr")
+        cfg["sms_max_price"] = cfg["sms"].get("max_price", "")
+        # Also sync proxy from top-level config for runner.py compatibility
+        cfg["proxy"] = cfg.get("proxy", "")
         cfg.pop("phase2", None)
+        cfg["upload_target"] = str(cfg.get("upload_target") or "sub2api").lower()
+        if cfg["upload_target"] not in ("sub2api", "cpa"):
+            cfg["upload_target"] = "sub2api"
+        cpa = dict(cfg.get("cpa") or {})
+        cfg["cpa"] = {
+            "management_url": cpa.get("management_url", ""),
+            "api_url": cpa.get("api_url", ""),
+            "management_key": cpa.get("management_key", ""),
+            "upload_mode": cpa.get("upload_mode", "auto") or "auto",
+        }
         _state["config"] = cfg
         _save_config_file(cfg)
         return jsonify({"ok": True, "config": _sanitize_config(cfg)})
@@ -264,7 +314,7 @@ def api_icloud_cookies():
         try:
             cookies = json.loads(raw)
         except json.JSONDecodeError as e:
-            return jsonify({"ok": False, "error": f"JSON 瑙ｆ瀽澶辫触: {e}"})
+            return jsonify({"ok": False, "error": f"JSON 解析失败: {e}"})
         COOKIES_FILE.write_text(json.dumps(cookies, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         _log(f"iCloud cookies 宸蹭繚瀛?({len(str(cookies))} bytes)", "success")
         return jsonify({"ok": True, "size": len(str(cookies))})
@@ -308,7 +358,7 @@ def api_plus_upgrade():
             )
             _log(f"[Plus] Cashier URL: {cashier_url[:60]}...", "success")
         except Exception as e:
-            _log(f"[Plus] 鐢熸垚鏀粯閾炬帴澶辫触: {e}", "error")
+            _log(f"[Plus] 生成支付链接失败: {e}", "error")
             return
 
         _log("[Plus] 娴忚鍣ㄦ姄鍙?Midtrans URL...", "info")
@@ -337,9 +387,9 @@ def api_plus_upgrade():
                     log_fn=lambda m: _log(f"[Plus] {m}", "info"),
                 )
                 if result.get("ok"):
-                    _log(f"[Plus] PayPal 浠樻鎴愬姛!", "success")
+                    _log(f"[Plus] PayPal 付款成功!", "success")
                 else:
-                    _log(f"[Plus] PayPal 澶辫触: {result.get('error')}", "error")
+                    _log(f"[Plus] PayPal 失败: {result.get('error')}", "error")
             except Exception as e:
                 _log(f"[Plus] PayPal 寮傚父: {e}", "error")
             return
@@ -375,9 +425,9 @@ def api_plus_upgrade():
                 wait_otp=wait_otp,
             )
             if result.get("success"):
-                _log(f"[Plus] 浠樻鎴愬姛! status={result.get('transaction_status')}", "success")
+                _log(f"[Plus] 付款成功! status={result.get('transaction_status')}", "success")
             else:
-                _log(f"[Plus] 浠樻澶辫触: {result.get('detail')}", "error")
+                _log(f"[Plus] 付款失败: {result.get('detail')}", "error")
         except Exception as e:
             _log(f"[Plus] 浠樻寮傚父: {e}", "error")
 
@@ -410,8 +460,15 @@ def api_status():
 
 @app.route("/api/download")
 def api_download():
-    safe = [{k: v for k, v in r.items() if k != "access_token"}
-            for r in _state["results"] if r.get("ok")]
+    safe = []
+    for r in _state["results"]:
+        if not r.get("ok"):
+            continue
+        item = dict(r)
+        # Remove sensitive fields
+        for k in ["password", "chatgpt_password", "session_token", "access_token", "refresh_token", "id_token"]:
+            item.pop(k, None)
+        safe.append(item)
     ts = time.strftime("%Y%m%d_%H%M%S")
     path = Path(__file__).parent / f"results_{ts}.json"
     path.write_text(json.dumps(safe, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -488,6 +545,22 @@ def api_log_since(cursor):
     lines = _state["log_lines"][cursor:]
     return jsonify({"lines": lines, "cursor": len(_state["log_lines"])})
 
+def _result_upload_complete(data: dict) -> bool:
+    if not isinstance(data, dict):
+        return False
+    target = str(data.get("upload_target") or "sub2api").lower()
+    if data.get("final_ok") or (data.get("uploaded") and data.get("upload_verified", False)):
+        if target == "cpa":
+            return True
+        if data.get("sub2api_id") or data.get("sub2api_account_id"):
+            return True
+    if data.get("needs_retry"):
+        return False
+    if target == "cpa":
+        return bool(data.get("uploaded") and data.get("upload_verified", False))
+    return bool((data.get("sub2api_id") or data.get("sub2api_account_id")) and data.get("upload_verified", False))
+
+
 # ---- Results list API ----
 @app.route("/api/results-list")
 def api_results_list():
@@ -506,13 +579,16 @@ def api_results_list():
         except Exception:
             return jsonify({"ok": True, "items": []})
         for idx, data in enumerate(all_data):
-            if not data.get("ok"):
+            # Include both final_ok and phone_ok results
+            if not data.get("ok") and not data.get("phone_ok"):
+                continue
+            if _result_upload_complete(data):
                 continue
             items.append({
                 "index": idx,
                 "phone": data.get("phone", "?"),
                 "name": data.get("name", ""),
-                "has_phase2": bool(data.get("sub2api_id")),
+                "has_phase2": _result_upload_complete(data),
                 "sub2api_id": data.get("sub2api_id", ""),
             })
     else:
@@ -523,13 +599,16 @@ def api_results_list():
                 data = json.loads(f.read_text(encoding="utf-8"))
             except Exception:
                 continue
-            if not data.get("ok"):
+            # Include both final_ok and phone_ok results
+            if not data.get("ok") and not data.get("phone_ok"):
+                continue
+            if _result_upload_complete(data):
                 continue
             items.append({
                 "filename": f.name,
                 "phone": data.get("phone", "?"),
                 "name": data.get("name", ""),
-                "has_phase2": bool(data.get("sub2api_id")),
+                "has_phase2": _result_upload_complete(data),
                 "sub2api_id": data.get("sub2api_id", ""),
             })
     return jsonify({"ok": True, "items": items})
@@ -667,10 +746,12 @@ def _classify_outlook_status(has_success_result: bool, last_event_status: str, h
         return "bad"
     if status == "verify_failed":
         return "verify_failed"
-    if status == "reserved":
-        return "reserved"
+    # Once a result exists, do not keep showing the earlier reserved event.
+    # Successful Phase2 is handled above; remaining result records mean registration/Phase2 failed.
     if has_result:
         return "register_failed"
+    if status == "reserved":
+        return "reserved"
     return "unused"
 
 
@@ -693,7 +774,13 @@ def _build_outlook_pool_entries(config: dict | None = None) -> list[dict]:
         if not bind_email:
             continue
         has_results.add(bind_email)
-        if record["sub2api_id"]:
+        target = str(record.get("data", {}).get("upload_target") or "sub2api").lower()
+        upload_complete = bool(record.get("data", {}).get("uploaded") and record.get("data", {}).get("upload_verified", False))
+        if target == "cpa":
+            is_success = upload_complete
+        else:
+            is_success = bool((record["sub2api_id"] or record.get("data", {}).get("sub2api_account_id")) and record.get("data", {}).get("upload_verified", False))
+        if is_success:
             success_results.add(bind_email)
         current = latest_results.get(bind_email)
         if current is None or record["recorded_at"] >= current["recorded_at"]:
@@ -956,89 +1043,116 @@ def api_outlook_pool_action():
 
     return jsonify({"ok": False, "error": "unsupported action"}), 400
 
-def _phase2_for_result(result: dict, config: dict, thread_tag: str = "", thread_id=None) -> dict:
-    """瀵瑰崟涓凡娉ㄥ唽璐﹀彿鎵ц Phase 2 (OAuth + 缁戦偖绠?+ 涓婁紶 SUB2API)"""
-    import requests as _r, urllib.parse as _up
-    sub = config.get("sub2api", {})
-    mm_config = config.get("mailmanage", {})
-    tlog = lambda msg, tag="info": _log(msg, tag, thread_id=thread_id)
 
-    _log(f"  [1/4] 鐧诲綍 SUB2API ...", "info")
-    r = _r.post(f"{sub['url']}/api/v1/auth/login",
-        json={"email": sub["email"], "password": sub.get("pwd", "")}, timeout=15)
-    login_data = r.json()
-    if login_data.get("code") != 0:
-        raise RuntimeError(f"SUB2API鐧诲綍澶辫触: {login_data.get('message','?')}")
-    admin_token = login_data["data"]["access_token"]
-
-    _log(f"  [2/4] 鑾峰彇 OAuth URL ...", "info")
-    r = _r.post(f"{sub['url']}/api/v1/admin/openai/generate-auth-url",
-        json={"redirect_uri": "http://localhost:1455/auth/callback"},
-        headers={"Authorization": f"Bearer {admin_token}"}, timeout=60)
-    oauth_data = r.json()
-    if oauth_data.get("code") != 0:
-        raise RuntimeError(f"鑾峰彇OAuth URL澶辫触: {oauth_data.get('message','?')}")
-    oauth_url = oauth_data["data"]["auth_url"]
-    session_id = oauth_data["data"]["session_id"]
-    oauth_state = _up.parse_qs(_up.urlparse(oauth_url).query).get("state", [""])[0]
-
-    group_id = 1
-    group_name = config.get("sub2api", {}).get("group", "CHATGPT")
+@app.route("/api/failed-uploads/list")
+def api_failed_uploads_list():
     try:
-        r = _r.get(f"{sub['url']}/api/v1/admin/groups",
-            headers={"Authorization": f"Bearer {admin_token}"}, timeout=15)
-        groups = r.json().get("data", {}).get("items", [])
-        for g in groups:
-            if g.get("name") == group_name:
-                group_id = g.get("id", 1)
-                _log(f"  [2/4] 鍒嗙粍: {group_name} (ID={group_id})", "info")
-                break
-        else:
-            _log(f"  [2/4] 鏈壘鍒板垎缁?{group_name}, 浣跨敤 ID=1", "warn")
+        from failed_uploads import BASE_DIR
+
+        base_dir = BASE_DIR.resolve()
+        items = []
+        if base_dir.exists():
+            for path in sorted(base_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+                try:
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    data = {}
+                items.append(
+                    {
+                        "filename": path.name,
+                        "path": f"failed_uploads/{path.name}",
+                        "phone": data.get("phone", ""),
+                        "email": data.get("email") or data.get("bind_email", ""),
+                        "upload_target": data.get("upload_target", "sub2api"),
+                        "created_at": data.get("created_at", ""),
+                        "last_error": data.get("last_error", ""),
+                    }
+                )
+        return jsonify({"ok": True, "items": items})
     except Exception as e:
-        _log(f"  [2/4] 鍒嗙粍鏌ヨ澶辫触: {e}, 浣跨敤 ID=1", "warn")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
-    bind_email = config.get("bind_email", "")
-    if not bind_email:
-        raise RuntimeError("bind_email is not configured")
 
-    _log(f"  [3/4] OAuth娴佺▼: 鐧诲綍->缁戦偖绠?>楠岃瘉->鍚屾剰->code ...", "info")
-    from openai_bind_email import run_second_half
-
-    def _wait_for_web_code(hint: str) -> str:
-        _log(f"  {thread_tag} [?] 绛夊緟杈撳叆楠岃瘉鐮? {hint}", "warn")
-        tid = thread_tag or "main"
-        tq = queue.Queue()
-        _state.setdefault("_code_queues", {})[tid] = tq
-        _state.setdefault("_code_waiting", {})[tid] = hint
+def _update_result_after_failed_upload_retry(failed_path: Path, retry_result: dict):
+    if not retry_result.get("ok"):
+        return
+    results_dir = Path(__file__).parent / "results"
+    if not results_dir.exists():
+        return
+    failed_resolved = str(Path(failed_path).resolve())
+    failed_name = Path(failed_path).name
+    for path in results_dir.glob("*.json"):
+        if path.name == "_all.json":
+            continue
         try:
-            return tq.get(timeout=120)
-        except queue.Empty:
-            _log(f"  {thread_tag} [?] verification code input timed out", "error")
-            return ""
-        finally:
-            _state.get("_code_waiting", {}).pop(tid, None)
-            _state.get("_code_queues", {}).pop(tid, None)
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        marker = str(data.get("failed_upload_file") or "")
+        if marker not in {failed_resolved, str(failed_path), f"failed_uploads/{failed_name}"} and Path(marker).name != failed_name:
+            continue
+        data["uploaded"] = True
+        data["upload_verified"] = True
+        data["needs_retry"] = False
+        data["final_ok"] = True
+        data["ok"] = True
+        data["status"] = "final_ok"
+        data["upload_target"] = retry_result.get("upload_target", data.get("upload_target", "sub2api"))
+        if retry_result.get("sub2api_account_id"):
+            data["sub2api_id"] = retry_result.get("sub2api_account_id")
+        data.pop("upload_error", None)
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
-    icloud_cookies = _load_phase2_icloud_cookies(config)
 
-    result2 = run_second_half(
-        oauth_url=oauth_url,
-        phone=result["phone"],
-        password=result["password"],
-        icloud_email=bind_email or "",
-        icloud_cookies=icloud_cookies,
-        sub2api_url=sub["url"],
-        sub2api_email=sub["email"],
-        sub2api_password=sub.get("pwd", ""),
-        proxy=config.get("proxy", ""),
-        verbose=True,
-        sub2api_session_id=session_id,
-        sub2api_state=oauth_state,
-        outlook_pool=config.get("outlook_pool", ""),
-        sub2api_proxy_id=int(config.get("sub2api", {}).get("proxy_id", 0) or 0),
-    )
-    return result2
+@app.route("/api/failed-uploads/retry", methods=["POST"])
+def api_failed_upload_retry():
+    d = request.json or {}
+    raw_path = str(d.get("path", "")).strip()
+    if not raw_path:
+        return jsonify({"ok": False, "error": "path is required"}), 400
+    try:
+        from failed_uploads import BASE_DIR, retry_failed_upload
+
+        base_dir = BASE_DIR.resolve()
+        requested = Path(raw_path)
+        candidate = requested if requested.is_absolute() else Path(__file__).parent / requested
+        resolved = candidate.resolve()
+        if resolved == base_dir or base_dir not in resolved.parents or resolved.suffix != ".json":
+            return jsonify({"ok": False, "error": "path must be a failed_uploads json file"}), 400
+        _log(f"[失败上传补传] 开始: {resolved.name}", "info")
+        result = retry_failed_upload(resolved, _state.get("config", {}))
+        _update_result_after_failed_upload_retry(resolved, result)
+        _record_stat(bool(result.get("ok")))
+        if result.get("ok"):
+            _log(f"[失败上传补传] 成功: {resolved.name}", "success")
+        else:
+            _log(f"[失败上传补传] 失败: {resolved.name} {result.get('error', result)}", "error")
+        return jsonify({"ok": bool(result.get("ok")), "result": result})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/batch-phase2-delete", methods=["POST"])
+def api_batch_phase2_delete():
+    d = request.json or {}
+    source = d.get("source", "files")
+    if source != "files":
+        return jsonify({"ok": False, "error": "只能删除 results目录 的文件记录"}), 400
+    files = d.get("files", [])
+    if not files:
+        return jsonify({"ok": False, "error": "未选择文件"}), 400
+
+    results_dir = (Path(__file__).parent / "results").resolve()
+    deleted = 0
+    for name in files:
+        candidate = (results_dir / str(name)).resolve()
+        if candidate == results_dir or results_dir not in candidate.parents or candidate.suffix != ".json" or candidate.name == "_all.json":
+            return jsonify({"ok": False, "error": "只能删除 results 目录下的 JSON 结果文件"}), 400
+        if candidate.exists():
+            candidate.unlink()
+            deleted += 1
+    return jsonify({"ok": True, "deleted": deleted})
+
 
 @app.route("/api/batch-phase2", methods=["POST"])
 def api_batch_phase2():
@@ -1048,7 +1162,7 @@ def api_batch_phase2():
     source = d.get("source", "files")
     files = d.get("files", [])
     if not files:
-        return jsonify({"ok": False, "error": "鏈€夋嫨鏂囦欢"})
+        return jsonify({"ok": False, "error": "未选择文件"})
     email = d.get("email", "").strip()
     concurrency = max(1, min(int(d.get("concurrency", 1)), 10))
     _state["stop"] = False
@@ -1056,522 +1170,38 @@ def api_batch_phase2():
     threading.Thread(target=_run_batch_phase2, args=(files, cfg, email, source, concurrency), daemon=True).start()
     return jsonify({"ok": True})
 
-def _run_batch_phase2(files: list, config: dict, email: str = "", source: str = "files", concurrency: int = 1):
-    """Run Phase 2 for existing results."""
-    if email:
-        config["bind_email"] = email
-        _log(f"[琛ヨ窇] 浣跨敤鎸囧畾閭: {email}", "info")
 
-    email_provider = config.get("email_provider", "")
-    mm_config = config.get("mailmanage", {})
-    mm = None
-    ic = None
+def _country_order_for_attempt(countries, attempt_index: int, concurrency: int = 1):
+    """Return country order for an attempt.
 
-    if email_provider == "mailmanage" and mm_config.get("api_key") and not email:
-        try:
-            from mailmanage_client import MailManageClient
-            mm = MailManageClient(
-                api_key=mm_config["api_key"],
-                base_url=mm_config.get("base_url", ""),
-                verbose=False,
-            )
-            _log("[batch] MailManage client initialized", "info")
-        except Exception as e:
-            _log(f"[琛ヨ窇] MailManage 鍒濆鍖栧け璐? {e}", "error")
-    elif not email:
-        c = _load_phase2_icloud_cookies(config)
-        if c:
-            try:
-                from icloud_hme import ICloudHME
-                ic = ICloudHME(c, verbose=False)
-                _log("[batch] iCloud HME initialized", "info")
-            except Exception as e:
-                _log(f"[琛ヨ窇] iCloud 鍒濆鍖栧け璐? {e}", "error")
+    In parallel mode, all workers in the same concurrency wave should start from
+    the same cheapest-first order. Otherwise only the first worker gets the
+    cheapest country while other simultaneous workers start from later countries.
+    """
+    if len(countries) <= 1:
+        return countries
+    wave_size = max(1, concurrency)
+    wave_index = max(0, attempt_index) // wave_size
+    offset = wave_index % len(countries)
+    return countries[offset:] + countries[:offset]
 
-    _state["running"] = True
-    _state["_phase2_retry"] = False
-    old_stdout = sys.stdout
-    sys.stdout = _LogWriter(_log)
-    results_dir = Path(__file__).parent / "results"
 
-    sub = config.get("sub2api", {})
-    if not sub.get("url") or not sub.get("email"):
-        _log("[batch] please configure SUB2API url and email first", "error")
-        _state["running"] = False
-        sys.stdout = old_stdout
-        return
 
-    is_multi = concurrency > 1
-    if is_multi:
-        _log(f"[琛ヨ窇] 寮€濮嬫壒閲?Phase 2, 鍏?{len(files)} 涓处鍙? 骞惰 {concurrency} 绾跨▼", "info")
-    else:
-        _log(f"[batch] start Phase 2 for {len(files)} items", "info")
-
-    all_data = None
-    if source == "all":
-        all_path = results_dir / "_all.json"
-        if all_path.exists():
-            try:
-                all_data = json.loads(all_path.read_text(encoding="utf-8"))
-            except Exception as e:
-                _log(f"[琛ヨ窇] 璇诲彇 _all.json 澶辫触: {e}", "error")
-
-    _lock = threading.Lock()
-    _counter = {"ok": 0, "fail": 0}
-    _file_q = queue.Queue()
-    for f in files:
-        _file_q.put(f)
-
-    def _batch_worker(thread_id):
-        tag = f"[T{thread_id}]" if is_multi else ""
-        while not _state["stop"]:
-            try:
-                fname = _file_q.get_nowait()
-            except queue.Empty:
-                return
-
-            if source == "all":
-                try:
-                    idx = int(fname)
-                    if all_data is None or idx >= len(all_data):
-                        _log(f"[琛ヨ窇] {tag} 绱㈠紩 {idx} 瓒呭嚭鑼冨洿", "error")
-                        continue
-                    result = all_data[idx]
-                except (ValueError, IndexError, TypeError) as e:
-                    _log(f"[琛ヨ窇] {tag} 鏃犳晥绱㈠紩: {fname} ({e})", "error")
-                    continue
-            else:
-                fpath = results_dir / fname
-                if not fpath.exists():
-                    _log(f"[琛ヨ窇] {tag} 鏂囦欢涓嶅瓨鍦? {fname}", "error")
-                    continue
-                try:
-                    result = json.loads(fpath.read_text(encoding="utf-8"))
-                except Exception as e:
-                    _log(f"[琛ヨ窇] {tag} 璇诲彇澶辫触: {fname} ({e})", "error")
-                    continue
-
-            if not result.get("ok"):
-                _log(f"[琛ヨ窇] {tag} 璺宠繃澶辫触璁板綍: {result.get('phone','?')}", "warn")
-                continue
-
-            if result.get("sub2api_id"):
-                _log(f"[琛ヨ窇] {tag} 璺宠繃宸蹭笂浼? {result.get('phone','?')}", "info")
-                continue
-
-            phone = result.get("phone", "?")
-            used_email = email or ""
-
-            if not used_email and mm is not None:
-                try:
-                    used_email = mm.get_available_email(category=mm_config.get("category", "free"))
-                    _log(f"[琛ヨ窇] {tag} [{phone}] MailManage 鍙栧彿: {used_email}", "info")
-                except Exception as e:
-                    _log(f"[琛ヨ窇] {tag} [{phone}] MailManage 鍙栧彿澶辫触: {e}", "error")
-            elif not used_email and ic is not None:
-                try:
-                    used_email = ic.reuse_or_create_alias()
-                    _log(f"[琛ヨ窇] {tag} [{phone}] iCloud 鍒悕: {used_email}", "info")
-                except Exception as e:
-                    _log(f"[琛ヨ窇] {tag} [{phone}] iCloud 鍒涘缓澶辫触: {e}", "error")
-            elif not used_email:
-                _log(f"[琛ヨ窇] {tag} [{phone}] 鏃犲彲鐢ㄧ殑閭鎻愪緵鍟? 璺宠繃", "error")
-                with _lock:
-                    _counter["fail"] += 1
-                continue
-
-            thread_cfg = copy.deepcopy(config)
-            thread_cfg["bind_email"] = used_email
-            _log(f"[琛ヨ窇] {tag} [{phone}] 寮€濮?Phase 2 (閭: {used_email}) ...", "info")
-
-            try:
-                oauth_result = _phase2_for_result(result, thread_cfg, tag)
-            except Exception as e:
-                oauth_result = {"ok": False, "error": str(e)}
-
-            if oauth_result.get("ok"):
-                with _lock:
-                    _counter["ok"] += 1
-                result["sub2api_id"] = oauth_result.get("sub2api_account_id", "")
-                result["bind_email"] = used_email
-                with _lock:
-                    if source == "all" and all_data is not None:
-                        idx = int(fname)
-                        all_data[idx] = result
-                        (results_dir / "_all.json").write_text(
-                            json.dumps(all_data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-                    elif source == "files":
-                        fpath.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-                _log(f"[琛ヨ窇] {tag} [{phone}] 鎴愬姛! sub2api_id={result.get('sub2api_id','?')}", "success")
-                if mm is not None and used_email:
-                    try:
-                        mm.mark_used(used_email)
-                        _log(f"[琛ヨ窇] {tag} [{phone}] MailManage 宸叉爣璁? {used_email}", "info")
-                    except Exception as e:
-                        _log(f"[琛ヨ窇] {tag} [{phone}] 鏍囪澶辫触: {e}", "warn")
-            else:
-                with _lock:
-                    _counter["fail"] += 1
-                _log(f"[琛ヨ窇] {tag} [{phone}] 澶辫触: {oauth_result.get('error','?')}", "error")
-
-    try:
-        threads = []
-        for i in range(concurrency):
-            t = threading.Thread(target=_batch_worker, args=(i + 1,), daemon=True)
-            t.start()
-            threads.append(t)
-        for t in threads:
-            t.join()
-    finally:
-        sys.stdout = old_stdout
-
-    ok_count = _counter["ok"]
-    fail_count = _counter["fail"]
-    _state["running"] = False
-    _log(f"[琛ヨ窇] 瀹屾垚: {ok_count}鎴愬姛 / {fail_count}澶辫触", "success" if ok_count > 0 else "warn")
-
-# ---- Registration runner ----
-class _LogWriter:
-    def __init__(self, log_fn):
-        self._log = log_fn
-        self._buf = ""
-    def write(self, s):
-        self._buf += s
-        while "\n" in self._buf:
-            idx = self._buf.index("\n")
-            line = self._buf[:idx]
-            self._buf = self._buf[idx+1:]
-            line = line.strip()
-            if line:
-                self._log(line, "info")
-    def flush(self):
-        if self._buf.strip():
-            self._log(self._buf.strip(), "info")
-            self._buf = ""
-
-def _run(config, count, retries, concurrency=1):
-    old_stdout = sys.stdout
-    sys.stdout = _LogWriter(_log)
-    _state["_phase2_retry"] = False
-
-    sms_cfg = config.get("sms", {"api_key": "", "provider": "smsbower", "countries": ["151"], "service": "dr", "operator": "any", "max_price": ""})
-    key = sms_cfg.get("api_key", "")
-    provider = sms_cfg.get("provider", "smsbower")
-    sms = UnifiedSMS(provider=provider, api_key=key)
-    try:
-        _log(f"短信余额: {sms.balance()}", "info")
-    except: pass
-
-    results_dir = Path(__file__).parent / "results"
-    results_dir.mkdir(exist_ok=True)
-    is_multi = concurrency > 1
-    if is_multi:
-        _log(f"寮€濮嬫敞鍐? 鐩爣{count}涓? 姝ラ閲嶈瘯{retries}娆?姝? 骞惰{concurrency}绾跨▼", "success")
-    else:
-        _log(f"start registration: target={count} retries={retries}", "success")
-
-    sub = config.get("sub2api", {})
-    bind_email = config.get("bind_email", "")
-    email_provider = config.get("email_provider", "")
-    mm_config = config.get("mailmanage", {})
-    mm = None
-    debug_mode = config.get("debug_mode", False) and not is_multi
-
-    if email_provider == "mailmanage" and mm_config.get("api_key"):
-        try:
-            from mailmanage_client import MailManageClient
-            mm = MailManageClient(
-                api_key=mm_config["api_key"],
-                base_url=mm_config.get("base_url", ""),
-                verbose=False,
-            )
-        except Exception as e:
-            _log(f"MailManage 鍒濆鍖栧け璐? {e}", "error")
-
-    ic = None
-    if not bind_email and mm is None and not config.get("no_phase2") and sub.get("url"):
-        try:
-            c = _load_phase2_icloud_cookies(config)
-            _log(f"iCloud cookies: {'loaded' if c else 'missing'}", "info")
-            if c:
-                from icloud_hme import ICloudHME
-                ic = ICloudHME(c, verbose=False)
-        except Exception as e:
-            _log(f"iCloud鍒濆鍖栧け璐? {e}", "error")
-
-    max_attempts = count * 15
-    condition = threading.Condition()
-    counters = {"ok": 0, "attempt": 0, "active": 0}
-    _log(f"start run: target={count} concurrency={concurrency} retries={retries}", "success")
-
-    def claim_attempt():
-        with condition:
-            while True:
-                if _state["stop"] or counters["ok"] >= count or counters["attempt"] >= max_attempts:
-                    return None
-                if counters["ok"] + counters["active"] < count:
-                    counters["attempt"] += 1
-                    counters["active"] += 1
-                    return counters["attempt"], counters["ok"]
-                condition.wait(timeout=0.5)
-
-    def finish_registration(success):
-        with condition:
-            counters["active"] = max(0, counters["active"] - 1)
-            if success:
-                counters["ok"] += 1
-            condition.notify_all()
-
-    def _worker(thread_id):
-        tag = f"[T{thread_id}]" if is_multi else ""
-        thread_sms = UnifiedSMS(provider=provider, api_key=key)
-        while True:
-            claimed = claim_attempt()
-            if not claimed:
-                return
-            attempt_num, ok_so_far = claimed
-            _log(f"{tag} attempt {attempt_num} [{ok_so_far}/{count}]", "info", thread_id=thread_id)
-            thread_cfg = copy.deepcopy(config)
-            try:
-                result = ar.register_one(thread_sms, thread_cfg, verbose=True, step_retries=retries,
-                                         create_account_max_retries=20,
-                                         max_price=sms_cfg.get("max_price", ""),
-                                         no_phase2=config.get("no_phase2", False),
-                                         stop_requested=_stop_requested)
-            except ar.StopRequested:
-                _log(f"{tag} 宸插仠姝㈢瓑寰呮墜鏈哄彿", "warn", thread_id=thread_id)
-                finish_registration(False)
-                return
-            except Exception as e:
-                result = {"ok": False, "phone": "?", "error": str(e)}
-            if not result.get("ok") and thread_sms.activation_id:
-                try:
-                    thread_sms.cancel()
-                except Exception:
-                    pass
-
-            phone_ok = result.get("phone_ok", False)
-            final_ok = result.get("final_ok", False)
-            status = result.get("status", "register_failed")
-            failure_stage = result.get("failure_stage", "")
-            retryable = result.get("retryable", False)
-
-            _record_result(result)
-
-            # Log stage status
-            if final_ok:
-                _log(f"{tag} 成功: {result.get('phone','?')}  最终状态: final_ok", "success")
-            elif phone_ok:
-                _log(f"{tag} 手机号成功: {result.get('phone','?')}  状态: {status}  可补跑: {retryable}", "warn")
-            else:
-                _log(f"{tag} 失败: {result.get('phone','?')} {result.get('error','')}  阶段: {failure_stage}", "error")
-
-            # Count based on final_ok (or phone_ok if no_phase2)
-            if final_ok:
-                finish_registration(True)
-                ok_num = counters["ok"]
-                sys.stdout.flush()
-                _log(f"{tag} 注册成功: {result['phone']} [{ok_num}/{count}]", "success", thread_id=thread_id)
-            elif phone_ok and retryable:
-                # Phone succeeded but Phase2 not done yet — still count as partial success
-                finish_registration(True)
-                ok_num = counters["ok"]
-                sys.stdout.flush()
-                _log(f"{tag} 手机号成功 (待Phase2): {result['phone']} [{ok_num}/{count}]", "warn", thread_id=thread_id)
-            else:
-                finish_registration(False)
-                continue
-
-            # ---- Debug mode: pause (single-thread only) ----
-            if debug_mode:
-                _log("=" * 40, "warn")
-                _log(f"DEBUG - 注册完成，已暂停", "warn")
-                _log(f"Phone: {result['phone']}", "success")
-                # Do NOT log password or session_token in debug mode to prevent leakage
-                _log(f"Password: ***redacted***", "warn")
-                _log(f"Session Token: ***redacted***", "warn")
-                _log(f"阶段状态: phone_ok={result.get('phone_ok',False)} final_ok={result.get('final_ok',False)}", "info")
-                _log("=" * 40, "warn")
-                _state["_paused"] = True
-                try:
-                    _state["pause_queue"].get(timeout=300)
-                except queue.Empty:
-                    _log("DEBUG - timed out, auto continue", "warn")
-                _state["_paused"] = False
-
-            # Phase 2
-            phase2_ok = True
-            if not config.get("no_phase2") and sub.get("url") and sub.get("email") and result.get("session_token"):
-                if not bind_email:
-                    new_email = ""
-                    if mm is not None:
-                        try:
-                            new_email = mm.get_available_email(category=mm_config.get("category", "free"))
-                            _log(f"{tag} MailManage 閫夊畾: {new_email}", "success")
-                        except Exception as e:
-                            _log(f"{tag} MailManage 鑾峰彇閭澶辫触: {e}", "error")
-                    elif config.get("mail_provider") == "outlook":
-                        try:
-                            from outlook_mail import reserve_next_outlook
-                            outlook_account = reserve_next_outlook(
-                                config.get("outlook_pool") or "outlook.txt",
-                                config.get("outlook_used") or "outlook_used.txt",
-                            )
-                            new_email = outlook_account.email
-                            _log(f"{tag} Outlook閭: {new_email}", "success")
-                        except Exception as e:
-                            _log(f"{tag} Outlook鑾峰彇閭澶辫触: {e}", "error")
-                    elif ic is not None:
-                        try:
-                            new_email = ic.reuse_or_create_alias()
-                            _log(f"{tag} 鏂癷Cloud鍒悕: {new_email}", "success")
-                        except Exception as e:
-                            _log(f"{tag} iCloud鍒涘缓鍒悕澶辫触: {e}", "error")
-                    if new_email:
-                        thread_cfg["bind_email"] = new_email
-                    elif not thread_cfg.get("bind_email"):
-                        _log(f"{tag} 鏃犲彲鐢ㄧ殑閭鎻愪緵鍟? 璺宠繃Phase2", "error")
-                        _save_result(results_dir, result, thread_cfg)
-                        continue
-
-                _log(f"{tag} === Phase 2: OAuth + 缁戦偖绠?+ 涓婁紶 (閭: {thread_cfg.get('bind_email','?')}) ===", "info")
-                phase2_ok = False
-                while not phase2_ok and not _state["stop"]:
-
-                    def _do_phase2_once():
-                        import requests as _r, urllib.parse as _up
-                        _log(f"{tag}   [1/4] 鐧诲綍 SUB2API ...", "info")
-                        r = _r.post(f"{sub['url']}/api/v1/auth/login",
-                            json={"email": sub["email"], "password": sub.get("pwd", "")}, timeout=15)
-                        login_data = r.json()
-                        if login_data.get("code") != 0:
-                            raise RuntimeError(f"SUB2API鐧诲綍澶辫触: {login_data.get('message','?')}")
-                        admin_token = login_data["data"]["access_token"]
-
-                        _log(f"{tag}   [2/4] 鑾峰彇 OAuth URL ...", "info")
-                        r = _r.post(f"{sub['url']}/api/v1/admin/openai/generate-auth-url",
-                            json={"redirect_uri": "http://localhost:1455/auth/callback"},
-                            headers={"Authorization": f"Bearer {admin_token}"}, timeout=60)
-                        oauth_data = r.json()
-                        if oauth_data.get("code") != 0:
-                            raise RuntimeError(f"鑾峰彇OAuth URL澶辫触: {oauth_data.get('message','?')}")
-                        oauth_url = oauth_data["data"]["auth_url"]
-                        session_id = oauth_data["data"]["session_id"]
-                        oauth_state = _up.parse_qs(_up.urlparse(oauth_url).query).get("state", [""])[0]
-
-                        group_id = 1
-                        group_name = thread_cfg.get("sub2api", {}).get("group", "CHATGPT")
-                        try:
-                            r = _r.get(f"{sub['url']}/api/v1/admin/groups",
-                                headers={"Authorization": f"Bearer {admin_token}"}, timeout=15)
-                            groups = r.json().get("data", {}).get("items", [])
-                            for g in groups:
-                                if g.get("name") == group_name:
-                                    group_id = g.get("id", 1)
-                                    break
-                        except Exception:
-                            pass
-
-                        _log(f"{tag}   [3/4] OAuth娴佺▼ ...", "info")
-                        from openai_bind_email import run_second_half
-
-                        def _wait_for_web_code(hint: str) -> str:
-                            _log(f"{tag}   [?] 绛夊緟杈撳叆楠岃瘉鐮? {hint}", "warn")
-                            tid = tag or "main"
-                            tq = queue.Queue()
-                            _state.setdefault("_code_queues", {})[tid] = tq
-                            _state.setdefault("_code_waiting", {})[tid] = hint
-                            try:
-                                return tq.get(timeout=120)
-                            except queue.Empty:
-                                _log(f"{tag}   [?] verification code input timed out", "error")
-                                return ""
-                            finally:
-                                _state.get("_code_waiting", {}).pop(tid, None)
-                                _state.get("_code_queues", {}).pop(tid, None)
-
-                        icloud_cookies = _load_phase2_icloud_cookies(thread_cfg)
-
-                        result2 = run_second_half(
-                            oauth_url=oauth_url,
-                            phone=result["phone"],
-                            password=result["password"],
-                            icloud_email=thread_cfg.get("bind_email", "") or "",
-                            icloud_cookies=icloud_cookies,
-                            sub2api_url=sub["url"],
-                            sub2api_email=sub["email"],
-                            sub2api_password=sub.get("pwd", ""),
-                            proxy=thread_cfg.get("proxy", ""),
-                            verbose=True,
-                            sub2api_session_id=session_id,
-                            sub2api_state=oauth_state,
-                            outlook_pool=thread_cfg.get("outlook_pool", ""),
-                            sub2api_proxy_id=int(thread_cfg.get("sub2api", {}).get("proxy_id", 0) or 0),
-                        )
-                        return result2
-
-                    try:
-                        oauth_result = _do_phase2_once()
-                    except Exception as e:
-                        oauth_result = {"ok": False, "error": str(e)}
-
-                    if oauth_result.get("ok"):
-                        phase2_ok = True
-                        aid = oauth_result.get("sub2api_account_id", "?")
-                        _log(f"{tag}   [4/4] 涓婁紶鎴愬姛! SUB2API id={aid}", "success")
-                        result["sub2api_id"] = aid
-                    else:
-                        _log(f"{tag}   [4/4] Phase2澶辫触: {oauth_result.get('error','?')}", "warn")
-                        if is_multi or config.get("phase2_auto_skip"):
-                            _log(f"{tag}   鑷姩璺宠繃Phase2", "warn")
-                            break
-                        _state["_paused"] = True
-                        _state["_phase2_retry"] = True
-                        _log("  [?] 鐐?閲嶈瘯'閲嶆柊璧癙hase2, 鐐?璺宠繃'鏀惧純涓婁紶", "warn")
-                        try:
-                            action = _state["pause_queue"].get(timeout=600)
-                            if action == "skip":
-                                _log("  [?] 鐢ㄦ埛閫夋嫨璺宠繃Phase2", "warn")
-                                break
-                        except queue.Empty:
-                            _log("  [?] 瓒呮椂, 璺宠繃Phase2", "warn")
-                            break
-                        finally:
-                            _state["_paused"] = False
-
-            _save_result(results_dir, result, thread_cfg)
-            if mm is not None and thread_cfg.get("bind_email") and phase2_ok:
-                try:
-                    mm.mark_used(thread_cfg["bind_email"])
-                    _log(f"{tag} MailManage 宸叉爣璁? {thread_cfg['bind_email']}", "info")
-                except: pass
-
-    try:
-        threads = []
-        for i in range(concurrency):
-            t = threading.Thread(target=_worker, args=(i + 1,), daemon=True)
-            t.start()
-            threads.append(t)
-        for t in threads:
-            t.join()
-    finally:
-        sys.stdout = old_stdout
-
-    ok_count = counters["ok"]
-    _state["running"] = False
-    tag = "success" if ok_count >= count else "warn"
-    _log(f"瀹屾垚: {ok_count}/{count}", tag)
-
-# ---- Helpers ----
 def _save_config_file(cfg: dict):
     path = Path(__file__).parent / "config.json"
     path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 def _save_result(results_dir: Path, result: dict, config: dict):
-    if not result.get("ok"):
+    # Save both final OK and phone_ok (pending Phase2) results
+    if not result.get("ok") and not result.get("phone_ok"):
         return
     safe = dict(result)
     safe["bind_email"] = config.get("bind_email", "")
+    # Keep explicit credential aliases so future lookups do not depend on UI wording.
+    if safe.get("password"):
+        safe["chatgpt_password"] = safe.get("password", "")
+    if safe.get("bind_email"):
+        safe["account_email"] = safe.get("bind_email", "")
     ts = time.strftime("%Y%m%d_%H%M%S")
     phone = result.get("phone", "unknown").replace("+", "")
     path = results_dir / f"{phone}_{ts}.json"
@@ -1586,6 +1216,24 @@ def _save_result(results_dir: Path, result: dict, config: dict):
     all_results.append(safe)
     all_path.write_text(json.dumps(all_results, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
+    credential_record = {
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "phone": result.get("phone", ""),
+        "chatgpt_password": safe.get("chatgpt_password", ""),
+        "bind_email": safe.get("bind_email", ""),
+        "upload_target": safe.get("upload_target", config.get("upload_target", "")),
+        "status": safe.get("status", ""),
+        "result_file": str(path),
+    }
+    credentials_path = results_dir / "credentials.jsonl"
+    with credentials_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(credential_record, ensure_ascii=False) + "\n")
+    if credential_record.get("chatgpt_password"):
+        _log(
+            f"[凭证已保存] phone={credential_record['phone']} email={credential_record['bind_email'] or '-'} file={path.name}",
+            "success",
+        )
+
 def _sanitize_config(cfg):
     return copy.deepcopy(cfg)
 
@@ -1593,6 +1241,8 @@ def _sanitize_result(r):
     r2 = dict(r)
     for k in ["session_token", "access_token"]:
         if r2.get(k): r2[k] = r2[k][:30] + "..."
+    for k in ["password", "chatgpt_password", "refresh_token", "id_token"]:
+        if r2.get(k): r2[k] = "***"
     return r2
 
 class _LogWriter:
@@ -1648,14 +1298,79 @@ class _LogWriter:
             self._buffers[ident] = ""
 
 
+def _phase2_email_is_bound(result: dict) -> bool:
+    if _result_upload_complete(result):
+        return True
+    if result.get("email_bound") is False:
+        return False
+    return bool(result.get("bind_email"))
+
+
+def _phase2_error_status(error: str) -> str:
+    text = str(error or "").lower()
+    if "email_already_in_use" in text or "this email is already in use" in text:
+        return "email_already_in_use"
+    return "register_failed"
+
+
+def _validate_phase2_result(result: dict) -> None:
+    for field in ("phone", "password"):
+        if not str(result.get(field) or "").strip():
+            raise RuntimeError(f"missing_phase2_field:{field}")
+
+
 def _phase2_for_result(result: dict, config: dict, thread_tag: str = "", thread_id=None) -> dict:
+    """Run Phase 2 for one registered account and upload to selected target."""
+    _validate_phase2_result(result)
+    upload_target = str(config.get("upload_target") or "sub2api").lower()
+    bind_email = (config.get("bind_email") or "").strip()
+    if not bind_email:
+        raise RuntimeError("bind_email is not configured")
+
+    tlog = lambda msg, tag="info": _log(msg, tag, thread_id=thread_id)
+    icloud_cookies = _load_phase2_icloud_cookies(config)
+
+    if upload_target == "cpa":
+        from phase2_codex import get_cpa_oauth_url
+        from openai_bind_email import run_second_half
+
+        cpa = config.get("cpa", {})
+        if not cpa.get("api_url"):
+            raise RuntimeError("CPA API 地址未配置")
+        if not cpa.get("management_key"):
+            raise RuntimeError("CPA 管理密钥未配置")
+        tlog(f"{thread_tag} [1/4] 获取 CPA OAuth URL ...".strip(), "info")
+        oauth_info = get_cpa_oauth_url(cpa.get("api_url", ""), cpa.get("management_key", ""))
+        state_preview = (oauth_info.get("state") or "")[:8]
+        tlog(f"{thread_tag} [2/4] CPA state={state_preview}...".strip(), "info")
+        return run_second_half(
+            oauth_url=oauth_info["auth_url"],
+            phone=result["phone"],
+            password=result["password"],
+            icloud_email=bind_email,
+            icloud_cookies=icloud_cookies,
+            proxy=config.get("proxy", ""),
+            verbose=True,
+            outlook_pool=config.get("outlook_pool", ""),
+            upload_target="cpa",
+            cpa_api_url=cpa.get("api_url", ""),
+            cpa_management_key=cpa.get("management_key", ""),
+            cpa_upload_mode=cpa.get("upload_mode", "auto"),
+            cpa_oauth_state=oauth_info.get("state", ""),
+            session_token=result.get("session_token", ""),
+            access_token=result.get("access_token", ""),
+            refresh_token=result.get("refresh_token", ""),
+            id_token=result.get("id_token", ""),
+            account_id=result.get("account_id", ""),
+            expires_at=result.get("expires_at", 0),
+        )
+
     import requests as _r
     import urllib.parse as _up
+    from openai_bind_email import run_second_half
 
     sub = config.get("sub2api", {})
-    tlog = lambda msg, tag="info": _log(msg, tag, thread_id=thread_id)
-
-    tlog(f"{thread_tag} [1/4] 鐧诲綍 SUB2API ...".strip(), "info")
+    tlog(f"{thread_tag} [1/4] 登录 SUB2API ...".strip(), "info")
     login_resp = _r.post(
         f"{sub['url']}/api/v1/auth/login",
         json={"email": sub["email"], "password": sub.get("pwd", "")},
@@ -1663,23 +1378,28 @@ def _phase2_for_result(result: dict, config: dict, thread_tag: str = "", thread_
     )
     login_data = login_resp.json()
     if login_data.get("code") != 0:
-        raise RuntimeError(f"SUB2API鐧诲綍澶辫触: {login_data.get('message', '?')}")
+        raise RuntimeError(f"SUB2API登录失败: {login_data.get('message', '?')}")
     admin_token = login_data["data"]["access_token"]
 
-    tlog(f"{thread_tag} [2/4] 鑾峰彇 OAuth URL ...".strip(), "info")
+    tlog(f"{thread_tag} [2/4] 获取 OAuth URL ...".strip(), "info")
+    body = {"redirect_uri": "http://localhost:1455/auth/callback"}
+    proxy_id = int(config.get("sub2api", {}).get("proxy_id", 0) or 0)
+    if proxy_id:
+        body["proxy_id"] = proxy_id
     auth_resp = _r.post(
         f"{sub['url']}/api/v1/admin/openai/generate-auth-url",
-        json={"redirect_uri": "http://localhost:1455/auth/callback"},
+        json=body,
         headers={"Authorization": f"Bearer {admin_token}"},
         timeout=60,
     )
     auth_data = auth_resp.json()
     if auth_data.get("code") != 0:
-        raise RuntimeError(f"鑾峰彇OAuth URL澶辫触: {auth_data.get('message', '?')}")
+        raise RuntimeError(f"获取OAuth URL失败: {auth_data.get('message', '?')}")
     oauth_url = auth_data["data"]["auth_url"]
     session_id = auth_data["data"]["session_id"]
     oauth_state = _up.parse_qs(_up.urlparse(oauth_url).query).get("state", [""])[0]
 
+    group_id = 1
     group_name = config.get("sub2api", {}).get("group", "CHATGPT")
     try:
         group_resp = _r.get(
@@ -1688,23 +1408,14 @@ def _phase2_for_result(result: dict, config: dict, thread_tag: str = "", thread_
             timeout=15,
         )
         groups = group_resp.json().get("data", {}).get("items", [])
-        for group in groups:
-            if group.get("name") == group_name:
-                tlog(f"{thread_tag} [2/4] 鍒嗙粍: {group_name} (ID={group.get('id', 1)})".strip(), "info")
+        for g in groups:
+            if g.get("name") == group_name:
+                group_id = g.get("id", 1)
                 break
-        else:
-            tlog(f"{thread_tag} [2/4] 鏈壘鍒板垎缁?{group_name}, 浣跨敤榛樿鍒嗙粍".strip(), "warn")
     except Exception as e:
-        tlog(f"{thread_tag} [2/4] 鏌ヨ鍒嗙粍澶辫触: {e}".strip(), "warn")
+        tlog(f"{thread_tag} [2/4] 查询分组失败: {e}".strip(), "warn")
 
-    bind_email = (config.get("bind_email") or "").strip()
-    if not bind_email:
-        raise RuntimeError("bind_email is not configured")
-
-    tlog(f"{thread_tag} [3/4] OAuth 娴佺▼: 鐧诲綍 -> 缁戦偖绠?-> 楠岃瘉 -> 鍚屾剰 -> code ...".strip(), "info")
-    from openai_bind_email import run_second_half
-
-    icloud_cookies = _load_phase2_icloud_cookies(config)
+    tlog(f"{thread_tag} [3/4] OAuth 流程: 登录 -> 绑邮箱 -> 验证 -> 同意 -> code ...".strip(), "info")
     return run_second_half(
         oauth_url=oauth_url,
         phone=result["phone"],
@@ -1719,15 +1430,20 @@ def _phase2_for_result(result: dict, config: dict, thread_tag: str = "", thread_
         sub2api_session_id=session_id,
         sub2api_state=oauth_state,
         outlook_pool=config.get("outlook_pool", ""),
-        sub2api_proxy_id=int(config.get("sub2api", {}).get("proxy_id", 0) or 0),
+        sub2api_proxy_id=proxy_id,
+        sub2api_group_id=group_id,
+        upload_target="sub2api",
+        session_token=result.get("session_token", ""),
+        access_token=result.get("access_token", ""),
     )
 
 
 def _run_batch_phase2(files: list, config: dict, email: str = "", source: str = "files", concurrency: int = 1):
+    old_stdout = sys.stdout
     run_config = copy.deepcopy(config)
     if email:
         run_config["bind_email"] = email
-        _log(f"[琛ヨ窇] 浣跨敤鎸囧畾閭: {email}", "info")
+        _log(f"[补跑] 使用指定邮箱: {email}", "info")
 
     email_provider = run_config.get("email_provider", "")
     mm_config = run_config.get("mailmanage", {})
@@ -1736,38 +1452,70 @@ def _run_batch_phase2(files: list, config: dict, email: str = "", source: str = 
     provider_lock = threading.Lock()
     use_outlook = run_config.get("mail_provider") == "outlook" or email_provider == "outlook"
 
-    if email_provider == "mailmanage" and mm_config.get("api_key") and not email:
+    # 统一初始化邮箱提供商
+    provider_name, provider_instance, use_outlook = _get_email_provider(run_config, _log)
+    mm = provider_instance if provider_name == "mailmanage" else None
+    ic = provider_instance if provider_name == "icloud" else None
+
+    # 验证 Outlook 池存在
+    if use_outlook and not email:
+        outlook_pool_path = run_config.get("outlook_pool") or "outlook.txt"
+        from pathlib import Path as _Path
+        from outlook_mail import _is_inline_pool_text
+        is_inline = _is_inline_pool_text(outlook_pool_path)
+        if not is_inline:
+            outlook_file = _Path(outlook_pool_path)
+            if not outlook_file.is_absolute():
+                outlook_file = _Path(__file__).parent / outlook_pool_path
+            if not outlook_file.exists():
+                _log(f"[补跑] Outlook 池文件不存在: {outlook_file}", "error")
+                _log(f"[补跑] 请恢复 outlook.txt 或改用其他邮箱提供商", "error")
+                with _STATE_LOCK:
+                    _state["running"] = False
+                sys.stdout = old_stdout
+                return
+        # 检查是否有可用邮箱
         try:
-            from mailmanage_client import MailManageClient
-            mm = MailManageClient(
-                api_key=mm_config["api_key"],
-                base_url=mm_config.get("base_url", ""),
-                verbose=False,
-            )
-            _log("[batch] MailManage client initialized", "info")
+            from outlook_mail import load_outlook_accounts, _used_emails
+            accounts = load_outlook_accounts(outlook_pool_path if is_inline else str(outlook_file))
+            used = _used_emails(_Path(__file__).parent / (run_config.get("outlook_used") or "outlook_used.txt"))
+            available = [a for a in accounts if a.email.lower() not in used]
+            if not available:
+                _log(f"[补跑] Outlook 池中所有邮箱已被使用，无可用邮箱", "error")
+                _log(f"[补跑] 请恢复更多邮箱到 outlook.txt", "error")
+                with _STATE_LOCK:
+                    _state["running"] = False
+                sys.stdout = old_stdout
+                return
+            _log(f"[补跑] Outlook 可用邮箱: {len(available)}/{len(accounts)}", "info")
         except Exception as e:
-            _log(f"[琛ヨ窇] MailManage 鍒濆鍖栧け璐? {e}", "error")
-    elif not email and not use_outlook:
-        cookies = _load_phase2_icloud_cookies(run_config)
-        if cookies:
-            try:
-                from icloud_hme import ICloudHME
-                ic = ICloudHME(cookies, verbose=False)
-                _log("[batch] iCloud HME initialized", "info")
-            except Exception as e:
-                _log(f"[琛ヨ窇] iCloud 鍒濆鍖栧け璐? {e}", "error")
+            _log(f"[补跑] Outlook 池验证失败: {e}", "warn")
 
     with _STATE_LOCK:
         _state["running"] = True
         _state["_phase2_retry"] = False
 
-    old_stdout = sys.stdout
     log_writer = _LogWriter(_log)
     sys.stdout = log_writer
     results_dir = Path(__file__).parent / "results"
 
     sub = run_config.get("sub2api", {})
-    if not sub.get("url") or not sub.get("email"):
+    upload_target = str(run_config.get("upload_target") or "sub2api").lower()
+    cpa = run_config.get("cpa", {})
+    if upload_target == "cpa":
+        if not cpa.get("api_url"):
+            _log("[batch] CPA API 地址未配置", "error")
+            with _STATE_LOCK:
+                _state["running"] = False
+            sys.stdout = old_stdout
+            return
+        if not cpa.get("management_key"):
+            _log("[batch] CPA 管理密钥未配置", "error")
+            with _STATE_LOCK:
+                _state["running"] = False
+            sys.stdout = old_stdout
+            return
+    elif not sub.get("url") or not sub.get("email"):
         _log("[batch] please configure SUB2API url and email first", "error")
         with _STATE_LOCK:
             _state["running"] = False
@@ -1777,7 +1525,7 @@ def _run_batch_phase2(files: list, config: dict, email: str = "", source: str = 
     is_multi = concurrency > 1
     summary = f"[batch] start Phase 2 for {len(files)} items"
     if is_multi:
-        summary += f", 骞跺彂 {concurrency} 绾跨▼"
+        summary += f", 并发 {concurrency} 线程"
     _log(summary, "info")
 
     all_data = None
@@ -1787,27 +1535,58 @@ def _run_batch_phase2(files: list, config: dict, email: str = "", source: str = 
             try:
                 all_data = json.loads(all_path.read_text(encoding="utf-8"))
             except Exception as e:
-                _log(f"[琛ヨ窇] 璇诲彇 _all.json 澶辫触: {e}", "error")
+                _log(f"[补跑] 读取 _all.json 失败: {e}", "error")
 
-    counters = {"ok": 0, "fail": 0}
+    counters = {"ok": 0, "fail": 0, "processed": 0, "total": len(files)}
     counter_lock = threading.Lock()
     file_queue = queue.Queue()
     for item in files:
         file_queue.put(item)
 
-    def _reserve_email(thread_id, phone):
+    def _report_progress(tag=""):
+        """报告补跑进度"""
+        with counter_lock:
+            processed = counters["processed"]
+            total = counters["total"]
+            ok = counters["ok"]
+            fail = counters["fail"]
+            if total > 0:
+                pct = (processed / total) * 100
+                _log(f"[补跑] {tag} 进度: {processed}/{total} ({pct:.0f}%) - 成功:{ok} 失败:{fail}", "info")
+
+    def _reserve_email(thread_id, phone, original_email="", require_original=False):
         tag = f"[T{thread_id}]" if is_multi else ""
         tlog = lambda msg, level="info": _log(msg, level, thread_id=thread_id)
+
+        if original_email and require_original:
+            if use_outlook:
+                try:
+                    from outlook_mail import get_outlook_account
+
+                    get_outlook_account(
+                        original_email,
+                        run_config.get("outlook_pool") or "outlook.txt",
+                        run_config.get("outlook_used") or "outlook_used.txt",
+                    )
+                    tlog(f"[补跑] {tag} [{phone}] 使用原始邮箱: {original_email}", "info")
+                    return original_email
+                except Exception as e:
+                    tlog(f"[补跑] {tag} [{phone}] 原始邮箱不可用，无法补跑已绑定邮箱账号: {e}", "error")
+                    return ""
+            else:
+                tlog(f"[补跑] {tag} [{phone}] 使用原始邮箱: {original_email}", "info")
+                return original_email
+
         if email:
             return email
         if mm is not None:
             try:
                 with provider_lock:
                     picked = mm.get_available_email(category=mm_config.get("category", "free"))
-                tlog(f"[琛ヨ窇] {tag} [{phone}] MailManage 鍙栧彿: {picked}", "info")
+                tlog(f"[补跑] {tag} [{phone}] MailManage 取号: {picked}", "info")
                 return picked
             except Exception as e:
-                tlog(f"[琛ヨ窇] {tag} [{phone}] MailManage 鍙栧彿澶辫触: {e}", "error")
+                tlog(f"[补跑] {tag} [{phone}] MailManage 取号失败: {e}", "error")
                 return ""
         if use_outlook:
             try:
@@ -1818,19 +1597,19 @@ def _run_batch_phase2(files: list, config: dict, email: str = "", source: str = 
                         run_config.get("outlook_pool") or "outlook.txt",
                         run_config.get("outlook_used") or "outlook_used.txt",
                     )
-                tlog(f"[鐞涖儴绐嘳 {tag} [{phone}] Outlook 闁喚顔? {outlook_account.email}", "info")
+                tlog(f"[补跑] {tag} [{phone}] Outlook 取号: {outlook_account.email}", "info")
                 return outlook_account.email
             except Exception as e:
-                tlog(f"[鐞涖儴绐嘳 {tag} [{phone}] Outlook 閸欐牕褰挎径杈Е: {e}", "error")
+                tlog(f"[补跑] {tag} [{phone}] Outlook 閸欐牕褰挎径杈Е: {e}", "error")
                 return ""
         if ic is not None:
             try:
                 with provider_lock:
                     picked = ic.reuse_or_create_alias()
-                tlog(f"[琛ヨ窇] {tag} [{phone}] iCloud 鍒悕: {picked}", "info")
+                tlog(f"[补跑] {tag} [{phone}] iCloud 别名: {picked}", "info")
                 return picked
             except Exception as e:
-                tlog(f"[琛ヨ窇] {tag} [{phone}] iCloud 鍙栧彿澶辫触: {e}", "error")
+                tlog(f"[补跑] {tag} [{phone}] iCloud 取号失败: {e}", "error")
                 return ""
         return ""
 
@@ -1850,41 +1629,53 @@ def _run_batch_phase2(files: list, config: dict, email: str = "", source: str = 
                     try:
                         idx = int(fname)
                         if all_data is None or idx >= len(all_data):
-                            tlog(f"[琛ヨ窇] {tag} 绱㈠紩瓒呭嚭鑼冨洿: {fname}", "error")
+                            tlog(f"[补跑] {tag} 索引超出范围: {fname}", "error")
                             continue
                         result = dict(all_data[idx])
                     except (ValueError, IndexError, TypeError) as e:
-                        tlog(f"[琛ヨ窇] {tag} 鏃犳晥绱㈠紩: {fname} ({e})", "error")
+                        tlog(f"[补跑] {tag} 无效索引: {fname} ({e})", "error")
                         continue
                 else:
                     fpath = results_dir / fname
                     if not fpath.exists():
-                        tlog(f"[琛ヨ窇] {tag} 鏂囦欢涓嶅瓨鍦? {fname}", "error")
+                        tlog(f"[补跑] {tag} 文件不存在: {fname}", "error")
                         continue
                     try:
                         result = json.loads(fpath.read_text(encoding="utf-8"))
                     except Exception as e:
-                        tlog(f"[琛ヨ窇] {tag} 璇诲彇澶辫触: {fname} ({e})", "error")
+                        tlog(f"[补跑] {tag} 读取失败: {fname} ({e})", "error")
                         continue
 
-                if not result.get("ok"):
-                    tlog(f"[琛ヨ窇] {tag} 璺宠繃澶辫触璁板綍: {result.get('phone', '?')}", "warn")
+                # Accept both final OK and phone_ok (pending Phase2) records
+                if not result.get("ok") and not result.get("phone_ok"):
+                    tlog(f"[补跑] {tag} 跳过失败记录: {result.get('phone', '?')}", "warn")
                     continue
-                if result.get("sub2api_id"):
-                    tlog(f"[琛ヨ窇] {tag} 璺宠繃宸插畬鎴愯褰? {result.get('phone', '?')}", "info")
+                if _result_upload_complete(result):
+                    tlog(f"[补跑] {tag} 跳过已完成记录 {result.get('phone', '?')}", "info")
+                    continue
+                try:
+                    _validate_phase2_result(result)
+                except RuntimeError as e:
+                    phone = result.get("phone", "?")
+                    tlog(f"[补跑] {tag} [{phone}] 跳过无效记录: {e}", "error")
+                    with counter_lock:
+                        counters["fail"] += 1
+                    _record_stat(False)
                     continue
 
                 phone = result.get("phone", "?")
-                used_email = _reserve_email(thread_id, phone)
+                original_email = result.get("bind_email", "")
+                used_email = _reserve_email(thread_id, phone, original_email, require_original=_phase2_email_is_bound(result))
                 if not used_email:
-                    tlog(f"[琛ヨ窇] {tag} [{phone}] 娌℃湁鍙敤閭, 璺宠繃", "error")
+                    tlog(f"[补跑] {tag} [{phone}] 没有可用邮箱，跳过", "error")
                     with counter_lock:
                         counters["fail"] += 1
+                    _record_stat(False)
                     continue
 
                 thread_cfg = copy.deepcopy(run_config)
                 thread_cfg["bind_email"] = used_email
-                tlog(f"[琛ヨ窇] {tag} [{phone}] 寮€濮?Phase 2 (閭: {used_email}) ...", "info")
+                tlog(f"[补跑] {tag} [{phone}] 开始 Phase 2 (邮箱: {used_email}) ...", "info")
 
                 try:
                     oauth_result = _phase2_for_result(result, thread_cfg, tag, thread_id=thread_id)
@@ -1894,8 +1685,28 @@ def _run_batch_phase2(files: list, config: dict, email: str = "", source: str = 
                 if oauth_result.get("ok"):
                     with counter_lock:
                         counters["ok"] += 1
-                    result["sub2api_id"] = oauth_result.get("sub2api_account_id", "")
+                        counters["processed"] += 1
                     result["bind_email"] = used_email
+                    result["email_bound"] = True
+                    result["uploaded"] = bool(oauth_result.get("uploaded", True))
+                    result["upload_verified"] = bool(oauth_result.get("upload_verified", result["uploaded"]))
+                    result["upload_target"] = oauth_result.get("upload_target", thread_cfg.get("upload_target", "sub2api"))
+                    if oauth_result.get("sub2api_account_id"):
+                        result["sub2api_id"] = oauth_result.get("sub2api_account_id", "")
+                    if oauth_result.get("upload_error"):
+                        result["upload_error"] = oauth_result.get("upload_error", "")
+                    if oauth_result.get("failed_upload_file"):
+                        result["failed_upload_file"] = oauth_result.get("failed_upload_file", "")
+                    result["final_ok"] = bool(result["uploaded"] and result.get("upload_verified", False))
+                    result["ok"] = True
+                    result["status"] = "final_ok" if result["final_ok"] else "upload_unverified"
+                    _record_stat(result["final_ok"])
+                    if run_config.get("mail_provider") == "outlook" or run_config.get("email_provider") == "outlook":
+                        try:
+                            outlook_status = "success" if result["final_ok"] else "verify_failed"
+                            mark_outlook_status(used_email, outlook_status, run_config.get("outlook_used") or "outlook_used.txt")
+                        except Exception as e:
+                            tlog(f"[补跑] {tag} [{phone}] Outlook 状态更新失败: {e}", "warn")
                     with counter_lock:
                         if source == "all" and all_data is not None:
                             all_data[int(fname)] = result
@@ -1908,18 +1719,30 @@ def _run_batch_phase2(files: list, config: dict, email: str = "", source: str = 
                                 json.dumps(result, indent=2, ensure_ascii=False) + "\n",
                                 encoding="utf-8",
                             )
-                    tlog(f"[琛ヨ窇] {tag} [{phone}] 鎴愬姛, sub2api_id={result.get('sub2api_id', '?')}", "success")
+                    if result["uploaded"]:
+                        if result["upload_target"] == "cpa":
+                            tlog(f"[补跑] {tag} [{phone}] CPA 上传成功 ({oauth_result.get('upload_method', 'unknown')})", "success")
+                        else:
+                            tlog(f"[补跑] {tag} [{phone}] 成功, sub2api_id={result.get('sub2api_id', '?')}", "success")
+                    else:
+                        tlog(f"[补跑] {tag} [{phone}] 账号生成成功，但上传失败: {result.get('upload_error', '?')} 文件={result.get('failed_upload_file', '-')}", "warn")
                     if mm is not None:
                         try:
                             with provider_lock:
                                 mm.mark_used(used_email)
-                            tlog(f"[琛ヨ窇] {tag} [{phone}] MailManage 宸叉爣璁? {used_email}", "info")
+                            tlog(f"[补跑] {tag} [{phone}] MailManage 已标记: {used_email}", "info")
                         except Exception as e:
-                            tlog(f"[琛ヨ窇] {tag} [{phone}] 鏍囪澶辫触: {e}", "warn")
+                            tlog(f"[补跑] {tag} [{phone}] 标记失败: {e}", "warn")
                 else:
                     with counter_lock:
                         counters["fail"] += 1
-                    tlog(f"[琛ヨ窇] {tag} [{phone}] 澶辫触: {oauth_result.get('error', '?')}", "error")
+                    _record_stat(False)
+                    if run_config.get("mail_provider") == "outlook" or run_config.get("email_provider") == "outlook":
+                        try:
+                            mark_outlook_status(used_email, _phase2_error_status(oauth_result.get("error", "")), run_config.get("outlook_used") or "outlook_used.txt")
+                        except Exception as e:
+                            tlog(f"[补跑] {tag} [{phone}] Outlook 状态更新失败: {e}", "warn")
+                    tlog(f"[补跑] {tag} [{phone}] 失败: {oauth_result.get('error', '?')}", "error")
         finally:
             log_writer.unbind_thread()
 
@@ -1937,9 +1760,55 @@ def _run_batch_phase2(files: list, config: dict, email: str = "", source: str = 
     with _STATE_LOCK:
         _state["running"] = False
     _log(
-        f"[琛ヨ窇] 瀹屾垚: {counters['ok']} 鎴愬姛 / {counters['fail']} 澶辫触",
+        f"[补跑] 完成: {counters['ok']} 成功 / {counters['fail']} 失败",
         "success" if counters["ok"] > 0 else "warn",
     )
+
+
+def _get_email_provider(run_config, log_func=None):
+    """
+    统一邮箱提供商选择和初始化逻辑
+    返回: (provider_name, provider_instance, use_outlook)
+    """
+    email_provider = run_config.get("email_provider", "")
+    mm_config = run_config.get("mailmanage", {})
+    mm = None
+    ic = None
+    use_outlook = run_config.get("mail_provider") == "outlook" or email_provider == "outlook"
+
+    def _log(msg, level="info"):
+        if log_func:
+            log_func(msg, level)
+
+    if email_provider == "mailmanage" and mm_config.get("api_key"):
+        try:
+            from mailmanage_client import MailManageClient
+            mm = MailManageClient(
+                api_key=mm_config["api_key"],
+                base_url=mm_config.get("base_url", ""),
+                verbose=False,
+            )
+            _log("MailManage client initialized", "info")
+        except Exception as e:
+            _log(f"MailManage 初始化失败: {e}", "error")
+    elif not use_outlook:
+        cookies = _load_phase2_icloud_cookies(run_config)
+        if cookies:
+            try:
+                from icloud_hme import ICloudHME
+                ic = ICloudHME(cookies, verbose=False)
+                _log("iCloud HME initialized", "info")
+            except Exception as e:
+                _log(f"iCloud 初始化失败: {e}", "error")
+
+    if email_provider == "mailmanage" and mm:
+        return "mailmanage", mm, False
+    elif use_outlook:
+        return "outlook", None, True
+    elif ic:
+        return "icloud", ic, False
+    else:
+        return "none", None, False
 
 
 def _run(config, count, retries, concurrency=1):
@@ -1950,7 +1819,7 @@ def _run(config, count, retries, concurrency=1):
     with _STATE_LOCK:
         _state["_phase2_retry"] = False
 
-    sms_cfg = run_config.get("sms", {"api_key": "", "provider": "smsbower", "countries": ["151"], "service": "dr", "operator": "any", "max_price": ""})
+    sms_cfg = run_config.get("sms", {"api_key": "", "provider": "smsbower", "countries": [], "service": "dr", "operator": "any", "max_price": ar.DEFAULT_SMS_MAX_PRICE})
     key = sms_cfg.get("api_key", "")
     provider = sms_cfg.get("provider", "smsbower")
     sms = UnifiedSMS(provider=provider, api_key=key)
@@ -1959,15 +1828,28 @@ def _run(config, count, retries, concurrency=1):
     except Exception:
         pass
 
+    proxy = run_config.get("proxy", "")
+    if proxy:
+        _log(f"代理: {proxy}", "info")
+    else:
+        _log("代理: 未配置(直连)", "warn")
+
     results_dir = Path(__file__).parent / "results"
     results_dir.mkdir(exist_ok=True)
     is_multi = concurrency > 1
     start_msg = f"start registration: target={count} retries={retries}"
     if is_multi:
-        start_msg += f", 骞跺彂 {concurrency} 绾跨▼"
+        start_msg += f", 并发 {concurrency} 线程"
     _log(start_msg, "success")
 
     sub = run_config.get("sub2api", {})
+    upload_target = str(run_config.get("upload_target") or "sub2api").lower()
+    cpa = run_config.get("cpa", {})
+    phase2_enabled = not run_config.get("no_phase2", False)
+    if upload_target == "cpa":
+        phase2_configured = bool(cpa.get("api_url") and cpa.get("management_key"))
+    else:
+        phase2_configured = bool(sub.get("url") and sub.get("email"))
     bind_email = run_config.get("bind_email", "")
     email_provider = run_config.get("email_provider", "")
     mm_config = run_config.get("mailmanage", {})
@@ -1985,22 +1867,83 @@ def _run(config, count, retries, concurrency=1):
                 verbose=False,
             )
         except Exception as e:
-            _log(f"MailManage 鍒濆鍖栧け璐? {e}", "error")
+            _log(f"MailManage 初始化失败: {e}", "error")
 
-    ic = None
-    if not bind_email and mm is None and not use_outlook and not run_config.get("no_phase2") and sub.get("url"):
-        try:
-            cookies = _load_phase2_icloud_cookies(run_config)
-            _log(f"iCloud cookies: {'loaded' if cookies else 'missing'}", "info")
-            if cookies:
-                from icloud_hme import ICloudHME
-                ic = ICloudHME(cookies, verbose=False)
-        except Exception as e:
-            _log(f"iCloud 鍒濆鍖栧け璐? {e}", "error")
+    # 统一初始化邮箱提供商
+    provider_name, provider_instance, use_outlook = _get_email_provider(run_config, _log)
+    if provider_name == "mailmanage":
+        mm = provider_instance
+    elif provider_name == "icloud":
+        ic = provider_instance
+
+    # ── Pre-check: verify email pool has enough available accounts ──
+    if phase2_enabled and phase2_configured:
+        if not bind_email:
+            email_check_ok = False
+            available_count = 0
+            if mm is not None:
+                try:
+                    mailboxes = mm.list_mailboxes(category=mm_config.get("category", "free"), status="free")
+                    available_count = len(mailboxes)
+                    if available_count >= count:
+                        _log(f"邮箱池检查: MailManage 有 {available_count} 个可用邮箱 >= 目标 {count} ✓", "info")
+                        email_check_ok = True
+                    elif available_count > 0:
+                        _log(f"邮箱池检查: MailManage 仅有 {available_count} 个可用邮箱 < 目标 {count}，可用邮箱不足请补充邮箱", "error")
+                    else:
+                        _log(f"邮箱池检查: MailManage 没有可用邮箱 (category={mm_config.get('category','free')})", "error")
+                except Exception as e:
+                    _log(f"邮箱池检查失败: MailManage {e}", "error")
+            elif use_outlook:
+                outlook_pool = run_config.get("outlook_pool") or "outlook.txt"
+                outlook_used = run_config.get("outlook_used") or "outlook_used.txt"
+                try:
+                    from outlook_mail import load_outlook_accounts, _used_emails, _repo_path
+                    accounts = load_outlook_accounts(outlook_pool)
+                    used_file = _repo_path(outlook_used)
+                    used = _used_emails(used_file)
+                    available = [a for a in accounts if a.email.lower() not in used]
+                    available_count = len(available)
+                    if available_count >= count:
+                        _log(f"邮箱池检查: Outlook 有 {available_count}/{len(accounts)} 个未使用 >= 目标 {count} ✓", "info")
+                        email_check_ok = True
+                    elif available_count > 0:
+                        _log(f"邮箱池检查: Outlook 仅有 {available_count} 个可用邮箱 < 目标 {count}，可用邮箱不足请补充邮箱", "error")
+                    else:
+                        _log(f"邮箱池检查: Outlook 所有 {len(accounts)} 个账号都已使用，可用邮箱不足请补充邮箱", "error")
+                except Exception as e:
+                    _log(f"邮箱池检查失败: Outlook {e}", "error")
+            elif ic is not None:
+                # iCloud aliases can be created on the fly, no pool check needed
+                email_check_ok = True
+
+            if not email_check_ok:
+                _log("可用邮箱不足，请补充邮箱后重新启动程序", "error")
+                with _STATE_LOCK:
+                    _state["running"] = False
+                return
 
     max_attempts = count * 15
     condition = threading.Condition()
     counters = {"ok": 0, "attempt": 0, "active": 0}
+    countries_list = sms_cfg.get("countries", [])
+    if not countries_list:
+        _log("请先在配置中填写国家/地区 ID（多个用逗号分隔）", "error")
+        with _STATE_LOCK:
+            _state["running"] = False
+        return
+
+    # Sort countries by price if checkbox is enabled
+    sort_by_price = config.get("sms_sort_by_price", False) or config.get("sms_sort_by_price") == "1"
+    if sort_by_price and len(countries_list) > 1:
+        try:
+            sorted_info = sms.get_sorted_countries_by_price(countries_list, service=sms_cfg.get("service", "dr"))
+            countries_list = [item["country"] for item in sorted_info]
+            price_str = " → ".join(f"{item['country']}(${item['price']:.4f})" for item in sorted_info)
+            _log(f"[拿手机号] 按价格排序: {price_str}", "info")
+        except Exception as e:
+            _log(f"[拿手机号] 价格排序失败，使用原始顺序: {e}", "warn")
+
 
     def claim_attempt():
         with condition:
@@ -2020,6 +1963,9 @@ def _run(config, count, retries, concurrency=1):
                 counters["ok"] += 1
             condition.notify_all()
 
+    def _get_next_country(attempt_num):
+        return _country_order_for_attempt(countries_list, attempt_num - 1, concurrency)
+
     def reserve_phase2_email(thread_id):
         tag = f"[T{thread_id}]" if is_multi else ""
         tlog = lambda msg, level="info": _log(msg, level, thread_id=thread_id)
@@ -2030,7 +1976,7 @@ def _run(config, count, retries, concurrency=1):
                 tlog(f"{tag} MailManage 閫夊畾: {email_value}", "success")
                 return email_value
             except Exception as e:
-                tlog(f"{tag} MailManage 鑾峰彇閭澶辫触: {e}", "error")
+                tlog(f"{tag} MailManage 获取邮箱失败: {e}", "error")
                 return ""
         if use_outlook:
             try:
@@ -2040,19 +1986,19 @@ def _run(config, count, retries, concurrency=1):
                         run_config.get("outlook_pool") or "outlook.txt",
                         run_config.get("outlook_used") or "outlook_used.txt",
                     )
-                tlog(f"{tag} Outlook 閭: {outlook_account.email}", "success")
+                tlog(f"{tag} Outlook 邮箱: {outlook_account.email}", "success")
                 return outlook_account.email
             except Exception as e:
-                tlog(f"{tag} Outlook 鑾峰彇閭澶辫触: {e}", "error")
+                tlog(f"{tag} Outlook 获取邮箱失败: {e}", "error")
                 return ""
         if ic is not None:
             try:
                 with provider_lock:
                     email_value = ic.reuse_or_create_alias()
-                tlog(f"{tag} 鏂?iCloud 鍒悕: {email_value}", "success")
+                tlog(f"{tag} 鏂?iCloud 别名: {email_value}", "success")
                 return email_value
             except Exception as e:
-                tlog(f"{tag} iCloud 鍒悕澶辫触: {e}", "error")
+                tlog(f"{tag} iCloud 别名失败: {e}", "error")
                 return ""
         return ""
 
@@ -2069,6 +2015,7 @@ def _run(config, count, retries, concurrency=1):
                 attempt_num, ok_so_far = claimed
                 tlog(f"{tag} attempt {attempt_num} [{ok_so_far}/{count}]", "info")
                 thread_cfg = copy.deepcopy(run_config)
+                thread_cfg["sms"]["countries"] = _get_next_country(attempt_num)
                 try:
                     result = ar.register_one(
                         thread_sms,
@@ -2081,7 +2028,7 @@ def _run(config, count, retries, concurrency=1):
                         stop_requested=_stop_requested,
                     )
                 except ar.StopRequested:
-                    tlog(f"{tag} 宸插仠姝㈢瓑寰呮墜鏈哄彿", "warn")
+                    tlog(f"{tag} 已停止等待手机号", "warn")
                     finish_registration(False)
                     return
                 except Exception as e:
@@ -2110,18 +2057,24 @@ def _run(config, count, retries, concurrency=1):
                     tlog(f"{tag} 失败: {result.get('phone','?')} {result.get('error','')}  阶段: {failure_stage}", "error")
 
                 # Count based on final_ok (or phone_ok if no_phase2)
+                counted = False
                 if final_ok:
                     finish_registration(True)
+                    _record_stat(True)
+                    counted = True
                     ok_num = counters["ok"]
                     sys.stdout.flush()
                     tlog(f"{tag} 注册成功: {result['phone']} [{ok_num}/{count}]", "success")
-                elif phone_ok and retryable:
+                elif phone_ok and retryable and not (phase2_enabled and phase2_configured):
                     finish_registration(True)
+                    _record_stat(False)
+                    counted = True
                     ok_num = counters["ok"]
                     sys.stdout.flush()
                     tlog(f"{tag} 手机号成功 (待Phase2): {result['phone']} [{ok_num}/{count}]", "warn")
-                else:
+                elif not phone_ok:
                     finish_registration(False)
+                    _record_stat(False)
                     continue
 
                 if debug_mode:
@@ -2142,26 +2095,33 @@ def _run(config, count, retries, concurrency=1):
 
                 phase2_ok = True
                 if (
-                    not run_config.get("no_phase2")
-                    and sub.get("url")
-                    and sub.get("email")
+                    phase2_enabled
+                    and phase2_configured
                     and result.get("session_token")
                 ):
-                    if not bind_email:
-                        new_email = reserve_phase2_email(thread_id)
-                        if new_email:
-                            thread_cfg["bind_email"] = new_email
-                        elif not thread_cfg.get("bind_email"):
-                            tlog(f"{tag} 娌℃湁鍙敤閭锛岃烦杩?Phase 2", "error")
-                            _save_result(results_dir, result, thread_cfg)
-                            continue
-
-                    tlog(
-                        f"{tag} === Phase 2: OAuth + 缁戦偖绠?+ 涓婁紶 (閭: {thread_cfg.get('bind_email', '?')}) ===",
-                        "info",
-                    )
                     phase2_ok = False
-                    while not phase2_ok and not _state["stop"]:
+                    phase2_max_retries = 5
+                    phase2_retries = 0
+
+                    while not phase2_ok and not _state["stop"] and phase2_retries < phase2_max_retries:
+                        phase2_retries += 1
+                        if phase2_retries > 1 or not thread_cfg.get("bind_email"):
+                            if not bind_email:
+                                new_email = reserve_phase2_email(thread_id)
+                                if new_email:
+                                    thread_cfg["bind_email"] = new_email
+                                    tlog(f"{tag} 获取到邮箱: {new_email} (Phase2 重试 #{phase2_retries})", "success")
+                                elif not thread_cfg.get("bind_email"):
+                                    tlog(f"{tag} 无可用邮箱，跳过 Phase 2，继续使用此手机号", "warn")
+                                    phase2_ok = True  # Mark as OK so we don't keep retrying without email
+                                    break
+
+                        tlog(
+                            f"{tag} === Phase 2: OAuth + 绑邮箱 + 上传 (邮箱: {thread_cfg.get('bind_email', '?')}) 重试 {phase2_retries}/{phase2_max_retries} ===",
+                            "info",
+                        )
+                        phase2_ok = False
+
                         try:
                             oauth_result = _phase2_for_result(result, thread_cfg, tag, thread_id=thread_id)
                         except Exception as e:
@@ -2169,34 +2129,66 @@ def _run(config, count, retries, concurrency=1):
 
                         if oauth_result.get("ok"):
                             phase2_ok = True
-                            aid = oauth_result.get("sub2api_account_id", "?")
-                            result["sub2api_id"] = aid
-                            tlog(f"{tag}   [4/4] 涓婁紶鎴愬姛: SUB2API id={aid}", "success")
+                            result["bind_email"] = thread_cfg.get("bind_email", "")
+                            result["email_bound"] = True
+                            result["uploaded"] = bool(oauth_result.get("uploaded", True))
+                            result["upload_verified"] = bool(oauth_result.get("upload_verified", result["uploaded"]))
+                            result["needs_retry"] = bool(oauth_result.get("needs_retry", not result["upload_verified"]))
+                            result["upload_target"] = oauth_result.get("upload_target", thread_cfg.get("upload_target", "sub2api"))
+                            if oauth_result.get("sub2api_account_id"):
+                                result["sub2api_id"] = oauth_result.get("sub2api_account_id", "")
+                            if oauth_result.get("upload_error"):
+                                result["upload_error"] = oauth_result.get("upload_error", "")
+                            if oauth_result.get("failed_upload_file"):
+                                result["failed_upload_file"] = oauth_result.get("failed_upload_file", "")
+                            result["final_ok"] = bool(result["uploaded"] and result.get("upload_verified", False))
+                            result["ok"] = True
+                            result["status"] = "final_ok" if result["final_ok"] else "upload_unverified"
+                            if result["uploaded"]:
+                                if result["upload_target"] == "cpa":
+                                    tlog(f"{tag}   [4/4] CPA 上传成功 ({oauth_result.get('upload_method', 'unknown')})", "success")
+                                else:
+                                    aid = oauth_result.get("sub2api_account_id", "?")
+                                    tlog(f"{tag}   [4/4] 上传成功: SUB2API id={aid}", "success")
+                            else:
+                                tlog(f"{tag}   [4/4] 账号生成成功，但上传失败: {result.get('upload_error', '?')} 文件={result.get('failed_upload_file', '-')}", "warn")
+                            if run_config.get("mail_provider") == "outlook" or run_config.get("email_provider") == "outlook":
+                                try:
+                                    outlook_status = "success" if result.get("final_ok") else "verify_failed"
+                                    mark_outlook_status(thread_cfg.get("bind_email", ""), outlook_status, run_config.get("outlook_used") or "outlook_used.txt")
+                                except Exception as e:
+                                    tlog(f"{tag} Outlook 状态更新失败: {e}", "warn")
                         else:
-                            tlog(f"{tag}   [4/4] Phase 2 澶辫触: {oauth_result.get('error', '?')}", "warn")
-                            if is_multi or run_config.get("phase2_auto_skip"):
-                                tlog(f"{tag}   鑷姩璺宠繃 Phase 2", "warn")
+                            if run_config.get("mail_provider") == "outlook" or run_config.get("email_provider") == "outlook":
+                                try:
+                                    mark_outlook_status(thread_cfg.get("bind_email", ""), _phase2_error_status(oauth_result.get("error", "")), run_config.get("outlook_used") or "outlook_used.txt")
+                                except Exception as e:
+                                    tlog(f"{tag} Outlook 状态更新失败: {e}", "warn")
+                            error_msg = oauth_result.get('error', '?')
+                            from openai_bind_email import classify_error
+                            error_type = classify_error(error_msg)
+                            if error_type == "permanent":
+                                tlog(f"{tag}   [4/4] Phase 2 永久失败 (不重试): {error_msg}", "error")
                                 break
-                            _state["_paused"] = True
-                            _state["_phase2_retry"] = True
-                            tlog("  [?] retry or skip Phase 2 from UI", "warn")
-                            try:
-                                action = _state["pause_queue"].get(timeout=600)
-                                if action == "skip":
-                                    tlog("  [?] 鐢ㄦ埛閫夋嫨璺宠繃 Phase 2", "warn")
-                                    break
-                            except queue.Empty:
-                                tlog("  [?] 绛夊緟瓒呮椂锛岃烦杩?Phase 2", "warn")
+                            elif error_type == "temporary":
+                                tlog(f"{tag}   [4/4] Phase 2 临时失败 (将重试): {error_msg}", "warn")
+                            else:
+                                tlog(f"{tag}   [4/4] Phase 2 失败: {error_msg} (重试 {phase2_retries}/{phase2_max_retries})", "warn")
+                            if phase2_retries >= phase2_max_retries:
+                                tlog(f"{tag}   Phase2 已达最大重试次数 {phase2_max_retries}，停止使用此手机号", "error")
                                 break
-                            finally:
-                                _state["_paused"] = False
+                            tlog(f"{tag}   将获取新邮箱自动重试...", "warn")
+                            continue
 
                 _save_result(results_dir, result, thread_cfg)
+                if not counted:
+                    finish_registration(False)
+                    _record_stat(bool(result.get("final_ok")))
                 if mm is not None and thread_cfg.get("bind_email") and phase2_ok:
                     try:
                         with provider_lock:
                             mm.mark_used(thread_cfg["bind_email"])
-                        tlog(f"{tag} MailManage 宸叉爣璁? {thread_cfg['bind_email']}", "info")
+                        tlog(f"{tag} MailManage 已标记: {thread_cfg['bind_email']}", "info")
                     except Exception:
                         pass
         finally:
@@ -2215,10 +2207,62 @@ def _run(config, count, retries, concurrency=1):
 
     with _STATE_LOCK:
         _state["running"] = False
-    _log(f"瀹屾垚: {counters['ok']}/{count}", "success" if counters["ok"] >= count else "warn")
+    _log(f"完成: {counters['ok']}/{count}", "success" if counters["ok"] >= count else "warn")
 
 
-def start_gui(host="0.0.0.0", port=7777):
+def _find_pending_phase2_items() -> list:
+    """扫描 results/ 目录，返回需要补跑 Phase2 的文件名列表"""
+    results_dir = Path(__file__).parent / "results"
+    if not results_dir.exists():
+        return []
+    pending = []
+    for f in sorted(results_dir.iterdir(), key=lambda x: x.name):
+        if f.suffix != ".json" or f.name == "_all.json":
+            continue
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if data.get("phone_ok") and not _result_upload_complete(data):
+            pending.append(f.name)
+    return pending
+
+
+def _auto_retry_phase2_on_startup():
+    """启动时自动补跑未完成的 Phase2"""
+    cfg = _state.get("config", {})
+    if not cfg.get("phase2_auto_skip", False):
+        _log("[自动补跑] 已关闭，跳过历史 Phase2 补跑", "info")
+        return
+    # 检查 Phase2 是否已配置（需要邮箱提供商）
+    email_provider = cfg.get("email_provider", "")
+    mm_config = cfg.get("mailmanage", {})
+    use_outlook = cfg.get("mail_provider") == "outlook" or email_provider == "outlook"
+    bind_email = cfg.get("bind_email", "")
+    has_provider = (
+        bind_email
+        or (email_provider == "mailmanage" and mm_config.get("api_key"))
+        or use_outlook
+    )
+    if not has_provider:
+        icloud_cookies = _load_phase2_icloud_cookies(cfg)
+        if not icloud_cookies:
+            return  # 没有邮箱提供商，跳过自动补跑
+
+    pending = _find_pending_phase2_items()
+    if not pending:
+        return
+
+    _log(f"[自动补跑] 发现 {len(pending)} 个待补跑 Phase2 的历史账号，自动启动补跑 ...", "info")
+    threading.Thread(
+        target=_run_batch_phase2,
+        args=(pending, cfg, "", "files", 1),
+        daemon=True,
+    ).start()
+
+
+def start_gui(host="0.0.0.0", port=7778):
+    _auto_retry_phase2_on_startup()
     print(f"http://127.0.0.1:{port}")
     app.run(host=host, port=port, debug=False, threaded=True)
 
@@ -2357,8 +2401,12 @@ button:disabled{opacity:0.4;cursor:not-allowed}
           </select>
           <label>API Key</label><input id="api_key" placeholder="your-sms-api-key">
           <label>代理</label><input id="proxy" placeholder="socks5h://127.0.0.1:10808">
-          <label>国家/地区 ID（按所选短信平台，多个用逗号分隔）</label><input id="countries" value="151" placeholder="151 或 151,52,6">
-          <label>最高价格</label><input id="max_price" placeholder="留空=不限">
+          <label>国家/地区 ID（按所选短信平台，多个用逗号分隔）</label><input id="countries" placeholder="例如 4,16（从配置读取，不使用默认国家）">
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px">
+            <input type="checkbox" id="sms_sort_by_price" style="width:auto;margin:0">
+            按最低价格自动排序（优先使用便宜的国家）
+          </label>
+          <label>最高价格</label><input id="max_price" value="0.03" placeholder="默认 0.03">
           <label>密码</label><input id="password" placeholder="留空=随机">
           <div class="row" style="margin-top:10px">
             <div style="flex:1"><label>目标数量</label><input id="count" value="1" type="number" min="1" max="99"></div>
@@ -2367,18 +2415,20 @@ button:disabled{opacity:0.4;cursor:not-allowed}
           </div>
           <div style="margin-top:12px;display:flex;gap:8px">
             <button class="btn-primary" id="btn-start" onclick="startReg()" style="flex:1">开始注册</button>
+            <button class="btn-neutral" id="btn-phase2" onclick="openBatchPanel()" style="flex:1">Phase 2 补跑</button>
+            <button class="btn-neutral" onclick="openFailedUploadsPanel()" style="flex:1">失败上传补传</button>
             <button class="btn-danger" id="btn-stop" onclick="stopReg()" disabled>停止</button>
           </div>
           <div class="worker-status" id="worker-status"></div>
         </div>
       </div>
       <div class="col">
-        <div class="card"><h2>Phase 2: 邮箱 &amp; SUB2API</h2>
+        <div class="card"><h2>Phase 2: 邮箱 &amp; 上传</h2>
           <label style="display:flex;align-items:center;gap:6px;font-size:13px;text-transform:none;letter-spacing:0;margin-top:0">
             <input type="checkbox" id="no_phase2" style="width:auto;margin:0"> 不跑 Phase 2
           </label>
           <label style="display:flex;align-items:center;gap:6px;font-size:13px;text-transform:none;letter-spacing:0">
-            <input type="checkbox" id="phase2_auto_skip" style="width:auto;margin:0"> Phase 2 失败自动跳过
+            <input type="checkbox" id="phase2_auto_skip" style="width:auto;margin:0"> 启动时自动补跑历史 Phase 2
           </label>
           <label>邮箱提供方</label>
           <select id="email_provider" onchange="toggleEmailProviderFields()">
@@ -2394,15 +2444,29 @@ button:disabled{opacity:0.4;cursor:not-allowed}
           <div id="outlook-group" style="display:none">
             <label>Outlook 账号池</label>
             <textarea id="outlook_pool" rows="6" style="font-family:var(--mono);font-size:11px" placeholder="email----password----client_id----refresh_token"></textarea>
+            <div style="font-size:11px;color:var(--ink-faint);line-height:1.5;margin-top:4px">Outlook 池是长期凭据库：已用邮箱不要删除，只追加新邮箱；重复分配由 outlook_used 状态控制。</div>
           </div>
           <div id="icloud-group">
             <label>iCloud 邮箱 (IMAP)</label><input id="imap_user" placeholder="xxx@icloud.com">
             <label>Apple 专用密码</label><input id="imap_pass" type="password">
           </div>
+          <label>上传平台</label>
+          <select id="upload_target" onchange="toggleUploadTargetFields()">
+            <option value="sub2api">SUB2API</option>
+            <option value="cpa">CPA</option>
+          </select>
+          <div id="sub2api-group">
           <label>SUB2API 地址</label><input id="sub2api_url">
           <label>管理邮箱</label><input id="sub2api_email">
           <label>管理密码</label><input id="sub2api_pwd" type="password">
           <label>目标分组</label><input id="sub2api_group" value="CHATGPT">
+          </div>
+          <div id="cpa-group" style="display:none">
+            <label>CPA 管理地址</label><input id="cpa_management_url" placeholder="http://47.89.129.103:18317">
+            <label>CPA API 地址</label><input id="cpa_api_url" placeholder="http://47.89.129.103:8317">
+            <label>CPA 管理密钥</label><input id="cpa_management_key" type="password">
+            <label>CPA 上传模式</label><input id="cpa_upload_mode" value="auto" readonly>
+          </div>
           <label>绑定邮箱</label><input id="bind_email">
           <label>iCloud Cookies 路径</label><input id="icloud_cookies" placeholder="cookies.json">
         </div>
@@ -2463,6 +2527,36 @@ button:disabled{opacity:0.4;cursor:not-allowed}
   <span id="pause-msg" style="color:var(--green);font-size:13px">暂停中</span>
   <button class="btn-primary" onclick="doContinue()" style="padding:4px 12px">继续</button>
   <button class="btn-danger" id="btn-skip-phase2" onclick="doSkipPhase2()" style="padding:4px 12px;display:none">跳过</button>
+</div>
+<div id="batch-panel" class="floating-panel" style="display:none;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:480px;max-height:70vh;background:#fff;border:1px solid var(--rule-strong);z-index:1000;flex-direction:column;padding:16px;border-radius:8px;box-shadow:0 8px 32px rgba(0,0,0,0.15)">
+  <h3 style="margin:0 0 12px;font-size:16px">Phase 2 补跑</h3>
+  <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center;font-size:12px">
+    <label style="margin:0">邮箱</label>
+    <input id="batch-email" placeholder="留空=自动获取" style="flex:1;padding:4px 8px;font-size:12px">
+    <select id="batch-source" style="padding:4px;font-size:12px"><option value="files">results目录</option></select>
+  </div>
+  <div id="batch-list" style="flex:1;overflow-y:auto;border:1px solid var(--rule);padding:4px;border-radius:4px;max-height:40vh"></div>
+  <div id="batch-summary" style="font-size:11px;color:var(--ink-faint);margin-top:8px">0 个待处理</div>
+  <div style="display:flex;gap:8px;margin-top:12px;align-items:center">
+    <label style="margin:0;font-size:12px"><input type="checkbox" id="batch-select-all" checked style="width:auto;margin:0" onchange="toggleSelectAll()"> 全选</label>
+    <span style="flex:1"></span>
+    <button class="btn-danger" id="btn-batch-delete" onclick="deleteSelectedBatchItems()" style="padding:4px 12px">删除所选</button>
+    <button class="btn-neutral" onclick="closeBatchPanel()" style="padding:4px 12px">关闭</button>
+    <button class="btn-primary" id="btn-batch-start" onclick="startBatchPhase2()" style="padding:4px 12px">开始补跑</button>
+    <span id="batch-running" style="display:none;font-size:11px;color:var(--ink-soft)">运行中...</span>
+  </div>
+</div>
+<div id="failed-upload-panel" class="floating-panel" style="display:none;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:520px;max-height:70vh;background:#fff;border:1px solid var(--rule-strong);z-index:1000;flex-direction:column;padding:16px;border-radius:8px;box-shadow:0 8px 32px rgba(0,0,0,0.15)">
+  <h3 style="margin:0 0 12px;font-size:16px">失败上传补传</h3>
+  <div id="failed-upload-list" style="flex:1;overflow-y:auto;border:1px solid var(--rule);padding:4px;border-radius:4px;max-height:40vh"></div>
+  <div id="failed-upload-summary" style="font-size:11px;color:var(--ink-faint);margin-top:8px">0 个待补传</div>
+  <div style="display:flex;gap:8px;margin-top:12px;align-items:center">
+    <label style="margin:0;font-size:12px"><input type="checkbox" id="failed-upload-select-all" checked style="width:auto;margin:0" onchange="toggleFailedUploadSelectAll()"> 全选</label>
+    <span style="flex:1"></span>
+    <button class="btn-neutral" onclick="closeFailedUploadsPanel()" style="padding:4px 12px">关闭</button>
+    <button class="btn-primary" id="btn-failed-upload-retry" onclick="retrySelectedFailedUploads()" style="padding:4px 12px">补传所选</button>
+    <span id="failed-upload-running" style="display:none;font-size:11px;color:var(--ink-soft)">补传中...</span>
+  </div>
 </div>
 <script>
 function G(id){return document.getElementById(id);}
@@ -2964,6 +3058,11 @@ function saveConfig(){
     mailmanage_keyword:G('mailmanage_keyword').value,
     outlook_pool:G('outlook_pool').value,
     imap_user:G('imap_user').value,imap_pass:G('imap_pass').value,
+    upload_target:G('upload_target').value,
+    cpa_management_url:G('cpa_management_url').value,
+    cpa_api_url:G('cpa_api_url').value,
+    cpa_management_key:G('cpa_management_key').value,
+    cpa_upload_mode:G('cpa_upload_mode').value,
     sub2api_url:G('sub2api_url').value,sub2api_email:G('sub2api_email').value,
     sub2api_pwd:G('sub2api_pwd').value,bind_email:G('bind_email').value,
     sub2api_group:G('sub2api_group').value,icloud_cookies:G('icloud_cookies').value,
@@ -2971,7 +3070,8 @@ function saveConfig(){
     plus_phone:G('plus_phone').value,plus_pin:G('plus_pin').value,
     plus_country:G('plus_country').value,plus_currency:G('plus_currency').value,
     debug_mode:'0',no_phase2:G('no_phase2').checked?'1':'0',
-    phase2_auto_skip:G('phase2_auto_skip').checked?'1':'0'};
+    phase2_auto_skip:G('phase2_auto_skip').checked?'1':'0',
+    sms_sort_by_price:G('sms_sort_by_price').checked?'1':'0'};
   return fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(function(r){return r.json()}).then(function(j){toast('配置已保存',j.ok);return j;});
 }
 
@@ -3074,6 +3174,12 @@ function loadCookiesStatus(){
   });
 }
 
+function toggleUploadTargetFields(){
+  var v=G('upload_target').value||'sub2api';
+  G('sub2api-group').style.display=(v=='sub2api'?'':'none');
+  G('cpa-group').style.display=(v=='cpa'?'':'none');
+}
+
 function toggleEmailProviderFields(){
   var v=G('email_provider').value;
   G('mm-group').style.display=(v=='mailmanage'?'':'none');
@@ -3089,18 +3195,21 @@ function loadConfig(){
     if(c.sms){
       G('sms_provider').value=c.sms.provider||'smsbower';
       G('api_key').value=c.sms.api_key||'';
-      G('countries').value=(c.sms.countries||['151']).join(',');
+      G('countries').value=(c.sms.countries||[]).join(',');
     } else if(c.smsbower) {
       // Legacy fallback
       G('sms_provider').value='smsbower';
       G('api_key').value=c.smsbower.api_key||'';
-      G('countries').value=c.country||'151';
+      G('countries').value=c.country||'';
     }
     G('proxy').value=c.proxy||'';
-    G('max_price').value=c.max_price||'';
+    G('max_price').value=(c.sms&&c.sms.max_price)||c.max_price||'0.03';
     if(c.register && c.register.password) G('password').value=c.register.password;
     if(c.icloud){G('imap_user').value=c.icloud.user||'';G('imap_pass').value=c.icloud.pass||'';}
     if(c.sub2api){G('sub2api_url').value=c.sub2api.url||'';G('sub2api_email').value=c.sub2api.email||'';G('sub2api_pwd').value=c.sub2api.pwd||'';G('sub2api_group').value=c.sub2api.group||'CHATGPT';}
+    G('upload_target').value=c.upload_target||'sub2api';
+    if(c.cpa){G('cpa_management_url').value=c.cpa.management_url||'';G('cpa_api_url').value=c.cpa.api_url||'';G('cpa_management_key').value=c.cpa.management_key||'';G('cpa_upload_mode').value=c.cpa.upload_mode||'auto';}
+    toggleUploadTargetFields();
     if(c.mailmanage){G('mailmanage_key').value=c.mailmanage.api_key||'';G('mailmanage_category').value=c.mailmanage.category||'safe';G('mailmanage_keyword').value=c.mailmanage.keyword||'gpt';}
     G('outlook_pool').value=c.outlook_pool||'';
     syncOutlookPoolEditor(c.outlook_pool||'');
@@ -3117,11 +3226,12 @@ function loadConfig(){
     togglePlusFields();
     if(c.no_phase2) G('no_phase2').checked=true;
     if(c.phase2_auto_skip) G('phase2_auto_skip').checked=true;
+    if(c.sms_sort_by_price) G('sms_sort_by_price').checked=true;
     checkBalance();
   });
 }
 
-// 琛ヨ窇 Phase2 鐩稿叧 JS (淇濇寔鍘熸湁閫昏緫)
+// 补跑 Phase2 相关 JS
 var _batchFiles = [];
 function openBatchPanel(){
   G('batch-panel').style.display='flex';
@@ -3137,11 +3247,11 @@ function openBatchPanel(){
     _batchFiles = j.items;
     var html='',todo=0,done=0;
     j.items.forEach(function(item){
-      var checked=!item.has_phase2?'checked':'';
-      if(!item.has_phase2) todo++; else done++;
+      var isChecked=!item.has_phase2;
+      if(isChecked) todo++; else done++;
       var key=item.filename||item.index;
       html+='<label style="display:flex;align-items:center;gap:6px;padding:3px 4px;border-bottom:1px solid #f0e4d0;cursor:pointer">'+
-        '<input type="checkbox" class="batch-cb" data-key="'+key+'" '+checked+' style="width:auto;margin:0">'+
+        '<input type="checkbox" class="batch-cb" data-key="'+key+'"'+(isChecked?' checked':'')+' style="width:auto;margin:0">'+
         '<span style="flex:1">'+item.phone+'</span>'+
         '<span style="font-size:11px;color:'+(item.has_phase2?'#2e7d32':'#999')+'">'+(item.has_phase2?'已完成':'待处理')+'</span></label>';
     });
@@ -3152,10 +3262,25 @@ function openBatchPanel(){
 }
 function closeBatchPanel(){G('batch-panel').style.display='none';}
 function toggleSelectAll(){var sel=G('batch-select-all').checked;document.querySelectorAll('.batch-cb').forEach(function(cb){cb.checked=sel;});}
-function startBatchPhase2(){
-  var files=[];document.querySelectorAll('.batch-cb:checked').forEach(function(cb){files.push(cb.dataset.key);});
+function selectedBatchKeys(){var files=[];document.querySelectorAll('.batch-cb:checked').forEach(function(cb){files.push(cb.dataset.key);});return files;}
+function deleteSelectedBatchItems(){
+  var files=selectedBatchKeys(),src=G('batch-source').value;
   if(!files.length){toast('请至少选择一个账号',false);return;}
-  var email=G('batch-email').value.trim(),src=G('batch-source').value,conc=parseInt(G('batch-concurrency').value)||1;
+  if(src!=='files'){toast('只能删除 results目录 的记录',false);return;}
+  if(!confirm('确定删除所选 '+files.length+' 条补跑记录？'))return;
+  G('btn-batch-delete').disabled=true;
+  fetch('/api/batch-phase2-delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({files:files,source:src})})
+    .then(function(r){return r.json()}).then(function(j){
+      G('btn-batch-delete').disabled=false;
+      if(!j.ok){toast(j.error,false);return;}
+      toast('已删除 '+j.deleted+' 条记录',true);
+      openBatchPanel();
+    }).catch(function(){G('btn-batch-delete').disabled=false;toast('删除失败',false);});
+}
+function startBatchPhase2(){
+  var files=selectedBatchKeys();
+  if(!files.length){toast('请至少选择一个账号',false);return;}
+  var email=G('batch-email').value.trim(),src=G('batch-source').value,conc=parseInt(G('batch-concurrency')?.value)||1;
   G('btn-batch-start').disabled=true;G('batch-running').style.display='inline';
   fetch('/api/batch-phase2',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({files:files,email:email,source:src,concurrency:conc})})
     .then(function(r){return r.json()}).then(function(j){
@@ -3165,6 +3290,48 @@ function startBatchPhase2(){
   var pollId=setInterval(function(){fetch('/api/status').then(function(r){return r.json()}).then(function(j){
     if(!j.running){clearInterval(pollId);G('btn-batch-start').disabled=false;G('batch-running').style.display='none';toast('补跑完成',true);openBatchPanel();}
   });},2000);
+}
+
+function openFailedUploadsPanel(){
+  G('failed-upload-panel').style.display='flex';
+  G('failed-upload-list').innerHTML='<div style="text-align:center;color:#aaa;padding:20px"><span class=spin></span>加载中...</div>';
+  fetch('/api/failed-uploads/list').then(function(r){return r.json()}).then(function(j){
+    if(!j.ok||!j.items.length){
+      G('failed-upload-list').innerHTML='<div style="text-align:center;color:#aaa;padding:20px">没有待补传文件</div>';
+      G('failed-upload-summary').textContent='0 个待补传';
+      return;
+    }
+    var html='';
+    j.items.forEach(function(item){
+      html+='<label style="display:flex;align-items:center;gap:6px;padding:3px 4px;border-bottom:1px solid #f0e4d0;cursor:pointer">'+
+        '<input type="checkbox" class="failed-upload-cb" data-path="'+escapeHtml(item.path)+'" checked style="width:auto;margin:0">'+
+        '<span style="flex:1">'+escapeHtml(item.phone||item.email||item.filename)+'</span>'+
+        '<span style="font-size:11px;color:#999">'+escapeHtml(item.upload_target||'sub2api')+'</span></label>';
+    });
+    G('failed-upload-list').innerHTML=html;
+    G('failed-upload-summary').textContent=j.items.length+' 个待补传';
+    G('failed-upload-select-all').checked=true;
+  }).catch(function(){G('failed-upload-list').innerHTML='<div style="text-align:center;color:#c62828;padding:20px">加载失败</div>';});
+}
+function closeFailedUploadsPanel(){G('failed-upload-panel').style.display='none';}
+function toggleFailedUploadSelectAll(){var sel=G('failed-upload-select-all').checked;document.querySelectorAll('.failed-upload-cb').forEach(function(cb){cb.checked=sel;});}
+function selectedFailedUploadPaths(){var paths=[];document.querySelectorAll('.failed-upload-cb:checked').forEach(function(cb){paths.push(cb.dataset.path);});return paths;}
+function retrySelectedFailedUploads(){
+  var paths=selectedFailedUploadPaths();
+  if(!paths.length){toast('请至少选择一个失败上传文件',false);return;}
+  G('btn-failed-upload-retry').disabled=true;G('failed-upload-running').style.display='inline';
+  var ok=0,fail=0;
+  paths.reduce(function(p,path){
+    return p.then(function(){
+      return fetch('/api/failed-uploads/retry',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:path})})
+        .then(function(r){return r.json()}).then(function(j){if(j.ok)ok++;else fail++;})
+        .catch(function(){fail++;});
+    });
+  },Promise.resolve()).then(function(){
+    G('btn-failed-upload-retry').disabled=false;G('failed-upload-running').style.display='none';
+    toast('补传完成：成功 '+ok+'，失败 '+fail,fail===0);
+    openFailedUploadsPanel();
+  });
 }
 
 function pollCodeNeed(){

@@ -83,7 +83,69 @@ class WebGuiStatsTests(unittest.TestCase):
             ],
         )
 
-    def test_api_config_roundtrips_plus_fields(self):
+    def test_parallel_country_order_keeps_cheapest_country_first_for_every_thread(self):
+        countries = ["16", "4", "33", "151"]
+
+        orders = [
+            web_gui._country_order_for_attempt(countries, attempt_index=i, concurrency=3)
+            for i in range(3)
+        ]
+
+        self.assertEqual(orders, [countries, countries, countries])
+
+        CONFIG_FILE.write_text(
+            json.dumps(
+                {
+                    "sms": {
+                        "provider": "smsbower",
+                        "api_key": "test",
+                        "countries": ["16"],
+                        "service": "dr",
+                    },
+                    "register": {"password": "", "name": "A", "birthdate": "2000-01-01"},
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with web_gui.app.test_client() as client:
+            resp = client.post("/api/config", json={"countries": "16"})
+            self.assertEqual(resp.status_code, 200)
+            data = resp.get_json()
+
+        cfg = data["config"]
+        self.assertEqual(cfg["sms"]["max_price"], "0.03")
+        self.assertEqual(cfg["sms_max_price"], "0.03")
+
+    def test_api_config_uses_posted_max_price_when_provided(self):
+        CONFIG_FILE.write_text(
+            json.dumps(
+                {
+                    "sms": {
+                        "provider": "smsbower",
+                        "api_key": "test",
+                        "countries": ["16"],
+                        "service": "dr",
+                    },
+                    "register": {"password": "", "name": "A", "birthdate": "2000-01-01"},
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with web_gui.app.test_client() as client:
+            resp = client.post("/api/config", json={"countries": "16", "max_price": "0.01"})
+            self.assertEqual(resp.status_code, 200)
+            data = resp.get_json()
+
+        cfg = data["config"]
+        self.assertEqual(cfg["sms"]["max_price"], "0.01")
+        self.assertEqual(cfg["sms_max_price"], "0.01")
+
         payload = {
             "plus_method": "paypal",
             "plus_email": "pay@example.com",
@@ -131,6 +193,633 @@ class WebGuiStatsTests(unittest.TestCase):
         self.assertEqual(cfg["email_provider"], "outlook")
         self.assertEqual(cfg["outlook_pool"], "a@outlook.com----pw----cid----rt")
 
+    def test_api_config_roundtrips_upload_target_and_cpa_settings(self):
+        payload = {
+            "upload_target": "cpa",
+            "cpa_management_url": "http://47.89.129.103:18317",
+            "cpa_api_url": "http://47.89.129.103:8317",
+            "cpa_management_key": "mgmt-key",
+            "cpa_upload_mode": "auto",
+        }
+
+        with web_gui.app.test_client() as client:
+            resp = client.post("/api/config", json=payload)
+            self.assertEqual(resp.status_code, 200)
+            data = resp.get_json()
+            self.assertTrue(data["ok"])
+
+            resp = client.get("/api/config")
+            self.assertEqual(resp.status_code, 200)
+            data = resp.get_json()
+
+        cfg = data["config"]
+        self.assertEqual(cfg["upload_target"], "cpa")
+        self.assertEqual(cfg["cpa"]["management_url"], "http://47.89.129.103:18317")
+        self.assertEqual(cfg["cpa"]["api_url"], "http://47.89.129.103:8317")
+        self.assertEqual(cfg["cpa"]["management_key"], "mgmt-key")
+        self.assertEqual(cfg["cpa"]["upload_mode"], "auto")
+
+
+
+    def test_auto_retry_phase2_on_startup_skips_when_config_disables_it(self):
+        web_gui._state["config"] = {"phase2_auto_skip": False}
+        entries = []
+
+        with mock.patch.object(web_gui, "_find_pending_phase2_items", return_value=["one.json"]):
+            with mock.patch.object(web_gui.threading, "Thread") as thread_cls:
+                with mock.patch.object(web_gui, "_log", side_effect=lambda msg, tag="info", thread_id=None: entries.append((msg, tag))):
+                    web_gui._auto_retry_phase2_on_startup()
+
+        thread_cls.assert_not_called()
+        self.assertIn(("[自动补跑] 已关闭，跳过历史 Phase2 补跑", "info"), entries)
+
+    def test_auto_retry_phase2_on_startup_runs_when_config_enables_it(self):
+        web_gui._state["config"] = {
+            "phase2_auto_skip": True,
+            "email_provider": "outlook",
+        }
+
+        with mock.patch.object(web_gui, "_find_pending_phase2_items", return_value=["one.json"]):
+            with mock.patch.object(web_gui.threading, "Thread") as thread_cls:
+                thread = thread_cls.return_value
+                web_gui._auto_retry_phase2_on_startup()
+
+        thread_cls.assert_called_once()
+        thread.start.assert_called_once()
+
+    def test_run_cleans_up_running_state_when_phase2_flags_are_missing(self):
+        config = {
+            "sms": {
+                "provider": "smsbower",
+                "api_key": "test",
+                "countries": ["16"],
+                "service": "dr",
+            },
+            "register": {"password": "", "name": "A", "birthdate": "2000-01-01"},
+            "no_phase2": True,
+        }
+
+        web_gui._state["running"] = True
+        web_gui._state["stop"] = False
+
+        with mock.patch("web_gui.UnifiedSMS") as sms_cls:
+            sms_cls.return_value.balance.return_value = "ACCESS_BALANCE:1"
+            with mock.patch("web_gui.ar.register_one", return_value={"ok": True, "phone": "+15551234567", "phone_ok": True, "final_ok": True, "status": "final_ok"}) as register_one:
+                web_gui._run(config, count=1, retries=0, concurrency=1)
+
+        self.assertFalse(web_gui._state["running"])
+        register_one.assert_called_once()
+
+    def test_run_saves_phone_ok_result_when_phase2_is_configured(self):
+        results_dir = Path(web_gui.__file__).with_name("results")
+        all_path = results_dir / "_all.json"
+        before_all = all_path.read_text(encoding="utf-8") if all_path.exists() else None
+        phone = "+15550001111"
+        try:
+            results_dir.mkdir(exist_ok=True)
+            for path in results_dir.glob("15550001111_*.json"):
+                path.unlink()
+
+            config = {
+                "sms": {
+                    "provider": "smsbower",
+                    "api_key": "test",
+                    "countries": ["16"],
+                    "service": "dr",
+                },
+                "register": {"password": "pw", "name": "A", "birthdate": "2000-01-01"},
+                "bind_email": "target@example.com",
+                "upload_target": "sub2api",
+                "sub2api": {"url": "https://sub.example.com", "email": "owner@example.com"},
+            }
+            result = {
+                "ok": True,
+                "phone_ok": True,
+                "final_ok": False,
+                "retryable": True,
+                "status": "phone_ok",
+                "phone": phone,
+                "password": "pw",
+                "session_token": "session-token",
+                "access_token": "access-token",
+            }
+
+            web_gui._state["running"] = True
+            web_gui._state["stop"] = False
+            web_gui._state["stats"] = web_gui._empty_stats()
+
+            with mock.patch("web_gui.UnifiedSMS") as sms_cls:
+                sms_cls.return_value.balance.return_value = "ACCESS_BALANCE:1"
+                with mock.patch("web_gui.ar.register_one", return_value=result):
+                    with mock.patch.object(web_gui, "_phase2_for_result", return_value={"ok": False, "error": "phase2_failed"}):
+                        web_gui._run(config, count=1, retries=0, concurrency=1)
+
+            saved_files = list(results_dir.glob("15550001111_*.json"))
+            self.assertEqual(len(saved_files), 1)
+            saved = json.loads(saved_files[0].read_text(encoding="utf-8"))
+            self.assertTrue(saved["phone_ok"])
+            self.assertFalse(saved["final_ok"])
+            self.assertEqual(saved["status"], "phone_ok")
+            self.assertEqual(web_gui._state["stats"]["current_success"], 0)
+            self.assertEqual(web_gui._state["stats"]["total_success"], 0)
+            self.assertGreater(web_gui._state["stats"]["current_fail"], 0)
+            self.assertEqual(web_gui._state["stats"]["current_fail"], web_gui._state["stats"]["total_fail"])
+        finally:
+            for path in results_dir.glob("15550001111_*.json"):
+                path.unlink()
+            if before_all is None:
+                if all_path.exists():
+                    all_path.unlink()
+            else:
+                all_path.write_text(before_all, encoding="utf-8")
+
+    def test_batch_phase2_does_not_fallback_when_original_outlook_email_missing_from_pool(self):
+        results_dir = Path(web_gui.__file__).with_name("results")
+        result_path = results_dir / "test_phase2_original_email_missing.json"
+        try:
+            results_dir.mkdir(exist_ok=True)
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "phone_ok": True,
+                        "phone": "+15551234567",
+                        "password": "pw",
+                        "bind_email": "old@outlook.com",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with tempfile.TemporaryDirectory() as tmp:
+                used_path = Path(tmp) / "outlook_used.txt"
+                used_path.write_text(
+                    "2026-06-14 10:00:00\told@outlook.com\treserved\n",
+                    encoding="utf-8",
+                )
+                config = {
+                    "email_provider": "outlook",
+                    "outlook_pool": "new@outlook.com----pw----client----refresh",
+                    "outlook_used": str(used_path),
+                    "upload_target": "cpa",
+                    "cpa": {"api_url": "https://cpa.example.com", "management_key": "key"},
+                    "bind_email": "",
+                }
+
+                with mock.patch.object(web_gui, "_phase2_for_result") as phase2:
+                    with mock.patch.object(web_gui, "_log") as log:
+                        web_gui._run_batch_phase2([result_path.name], config, source="files", concurrency=1)
+
+            phase2.assert_not_called()
+            messages = "\n".join(str(call.args[0]) for call in log.call_args_list if call.args)
+            self.assertIn("原始邮箱不可用", messages)
+            saved = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["bind_email"], "old@outlook.com")
+        finally:
+            if result_path.exists():
+                result_path.unlink()
+
+    def test_phase2_for_result_reports_missing_password(self):
+        config = {
+            "upload_target": "cpa",
+            "bind_email": "target@outlook.com",
+            "cpa": {"api_url": "https://cpa.example.com", "management_key": "key"},
+            "outlook_pool": "",
+        }
+        account = {"phone": "+15551234567"}
+
+        with self.assertRaisesRegex(RuntimeError, "missing_phase2_field:password"):
+            web_gui._phase2_for_result(account, config)
+
+    def test_batch_phase2_skips_record_missing_password_before_oauth(self):
+        results_dir = Path(web_gui.__file__).with_name("results")
+        result_path = results_dir / "test_phase2_missing_password.json"
+        try:
+            results_dir.mkdir(exist_ok=True)
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "phone_ok": True,
+                        "phone": "+15551234567",
+                        "bind_email": "old@outlook.com",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            config = {
+                "email_provider": "outlook",
+                "outlook_pool": "old@outlook.com----pw----client----refresh",
+                "outlook_used": "outlook_used.txt",
+                "upload_target": "cpa",
+                "cpa": {"api_url": "https://cpa.example.com", "management_key": "key"},
+                "bind_email": "",
+            }
+
+            with mock.patch.object(web_gui, "_phase2_for_result") as phase2:
+                with mock.patch.object(web_gui, "_log") as log:
+                    web_gui._run_batch_phase2([result_path.name], config, source="files", concurrency=1)
+
+            phase2.assert_not_called()
+            messages = "\n".join(str(call.args[0]) for call in log.call_args_list if call.args)
+            self.assertIn("missing_phase2_field:password", messages)
+        finally:
+            if result_path.exists():
+                result_path.unlink()
+
+    def test_batch_phase2_uses_new_outlook_email_when_previous_email_was_already_in_use(self):
+        results_dir = Path(web_gui.__file__).with_name("results")
+        result_path = results_dir / "test_phase2_email_already_in_use.json"
+        captured = {}
+        try:
+            web_gui._state["stats"] = web_gui._empty_stats()
+            results_dir.mkdir(exist_ok=True)
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "phone_ok": True,
+                        "phone": "+15551234567",
+                        "password": "pw",
+                        "bind_email": "used@outlook.com",
+                        "email_bound": False,
+                        "error": "verify_email_otp: email_already_in_use",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with tempfile.TemporaryDirectory() as tmp:
+                used_path = Path(tmp) / "outlook_used.txt"
+                used_path.write_text("2026-06-15 10:00:00\tused@outlook.com\temail_already_in_use\n", encoding="utf-8")
+                config = {
+                    "email_provider": "outlook",
+                    "outlook_pool": "used@outlook.com----pw----client----refresh\nnew@outlook.com----pw----client----refresh",
+                    "outlook_used": str(used_path),
+                    "upload_target": "cpa",
+                    "cpa": {"api_url": "https://cpa.example.com", "management_key": "key"},
+                    "bind_email": "",
+                }
+
+                def fake_phase2(result, config, thread_tag="", thread_id=None):
+                    captured["bind_email"] = config["bind_email"]
+                    return {"ok": True, "uploaded": True, "upload_verified": True, "upload_target": "cpa"}
+
+                with mock.patch.object(web_gui, "_phase2_for_result", side_effect=fake_phase2):
+                    with mock.patch.object(web_gui, "_log"):
+                        web_gui._run_batch_phase2([result_path.name], config, source="files", concurrency=1)
+
+            self.assertEqual(captured["bind_email"], "new@outlook.com")
+            saved = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["bind_email"], "new@outlook.com")
+            self.assertTrue(saved["email_bound"])
+            self.assertTrue(saved["final_ok"])
+            self.assertEqual(web_gui._state["stats"]["current_success"], 1)
+            self.assertEqual(web_gui._state["stats"]["total_success"], 1)
+        finally:
+            if result_path.exists():
+                result_path.unlink()
+
+    def test_batch_phase2_uses_new_outlook_email_when_record_has_no_original_email(self):
+        results_dir = Path(web_gui.__file__).with_name("results")
+        result_path = results_dir / "test_phase2_no_original_email.json"
+        captured = {}
+        try:
+            results_dir.mkdir(exist_ok=True)
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "phone_ok": True,
+                        "phone": "+15551234567",
+                        "password": "pw",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with tempfile.TemporaryDirectory() as tmp:
+                used_path = Path(tmp) / "outlook_used.txt"
+                config = {
+                    "email_provider": "outlook",
+                    "outlook_pool": "new@outlook.com----pw----client----refresh",
+                    "outlook_used": str(used_path),
+                    "upload_target": "cpa",
+                    "cpa": {"api_url": "https://cpa.example.com", "management_key": "key"},
+                    "bind_email": "",
+                }
+
+                def fake_phase2(result, config, thread_tag="", thread_id=None):
+                    captured["bind_email"] = config["bind_email"]
+                    return {"ok": True, "uploaded": True, "upload_verified": True, "upload_target": "cpa"}
+
+                with mock.patch.object(web_gui, "_phase2_for_result", side_effect=fake_phase2):
+                    with mock.patch.object(web_gui, "_log"):
+                        web_gui._run_batch_phase2([result_path.name], config, source="files", concurrency=1)
+
+            self.assertEqual(captured["bind_email"], "new@outlook.com")
+            saved = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["bind_email"], "new@outlook.com")
+            self.assertTrue(saved["final_ok"])
+        finally:
+            if result_path.exists():
+                result_path.unlink()
+
+    def test_batch_phase2_upload_without_verification_is_not_final_ok(self):
+        results_dir = Path(web_gui.__file__).with_name("results")
+        result_path = results_dir / "test_phase2_upload_unverified.json"
+        try:
+            results_dir.mkdir(exist_ok=True)
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "phone_ok": True,
+                        "phone": "+15551234567",
+                        "password": "pw",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with tempfile.TemporaryDirectory() as tmp:
+                used_path = Path(tmp) / "outlook_used.txt"
+                config = {
+                    "email_provider": "outlook",
+                    "outlook_pool": "new@outlook.com----pw----client----refresh",
+                    "outlook_used": str(used_path),
+                    "upload_target": "sub2api",
+                    "sub2api": {"url": "https://sub.example.com", "email": "admin@example.com", "pwd": "pw"},
+                    "bind_email": "",
+                }
+
+                def fake_phase2(result, config, thread_tag="", thread_id=None):
+                    return {"ok": True, "uploaded": True, "upload_verified": False, "upload_target": "sub2api"}
+
+                with mock.patch.object(web_gui, "_phase2_for_result", side_effect=fake_phase2):
+                    with mock.patch.object(web_gui, "_log"):
+                        web_gui._run_batch_phase2([result_path.name], config, source="files", concurrency=1)
+
+            saved = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertFalse(saved["final_ok"])
+            self.assertEqual(saved["status"], "upload_unverified")
+        finally:
+            if result_path.exists():
+                result_path.unlink()
+
+    def test_api_batch_phase2_delete_removes_selected_result_files(self):
+        results_dir = Path(web_gui.__file__).with_name("results")
+        keep_path = results_dir / "test_phase2_keep.json"
+        delete_a = results_dir / "test_phase2_delete_a.json"
+        delete_b = results_dir / "test_phase2_delete_b.json"
+        try:
+            results_dir.mkdir(exist_ok=True)
+            for path in (keep_path, delete_a, delete_b):
+                path.write_text('{"ok": true, "phone_ok": true}\n', encoding="utf-8")
+
+            with web_gui.app.test_client() as client:
+                resp = client.post(
+                    "/api/batch-phase2-delete",
+                    json={"source": "files", "files": [delete_a.name, delete_b.name]},
+                )
+
+            self.assertEqual(resp.status_code, 200)
+            data = resp.get_json()
+            self.assertTrue(data["ok"])
+            self.assertEqual(data["deleted"], 2)
+            self.assertTrue(keep_path.exists())
+            self.assertFalse(delete_a.exists())
+            self.assertFalse(delete_b.exists())
+        finally:
+            for path in (keep_path, delete_a, delete_b):
+                if path.exists():
+                    path.unlink()
+
+    def test_api_batch_phase2_delete_rejects_all_source(self):
+        with web_gui.app.test_client() as client:
+            resp = client.post(
+                "/api/batch-phase2-delete",
+                json={"source": "all", "files": ["0"]},
+            )
+
+        self.assertEqual(resp.status_code, 400)
+        data = resp.get_json()
+        self.assertFalse(data["ok"])
+        self.assertIn("results目录", data["error"])
+
+    def test_api_batch_phase2_delete_rejects_path_traversal(self):
+        with web_gui.app.test_client() as client:
+            resp = client.post(
+                "/api/batch-phase2-delete",
+                json={"source": "files", "files": ["../config.json"]},
+            )
+
+        self.assertEqual(resp.status_code, 400)
+        data = resp.get_json()
+        self.assertFalse(data["ok"])
+
+    def test_phase2_for_result_uses_cpa_oauth_url_and_passes_cpa_config(self):
+        config = {
+            "upload_target": "cpa",
+            "bind_email": "target@outlook.com",
+            "cpa": {
+                "management_url": "http://mgmt.example.com",
+                "api_url": "https://cpa.example.com",
+                "management_key": "mgmt-key",
+                "upload_mode": "auto",
+            },
+            "proxy": "",
+            "outlook_pool": "",
+        }
+        account = {
+            "phone": "+15551234567",
+            "password": "pw",
+            "session_token": "session-token",
+            "access_token": "access-token",
+        }
+        captured = {}
+
+        def fake_run_second_half(**kwargs):
+            captured.update(kwargs)
+            return {"ok": True, "uploaded": True, "upload_target": "cpa"}
+
+        with mock.patch("phase2_codex.get_cpa_oauth_url", return_value={"auth_url": "https://auth.openai.com/oauth/authorize?state=cpa-state", "state": "cpa-state"}):
+            with mock.patch("openai_bind_email.run_second_half", side_effect=fake_run_second_half):
+                result = web_gui._phase2_for_result(account, config)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(captured["upload_target"], "cpa")
+        self.assertEqual(captured["cpa_api_url"], "https://cpa.example.com")
+        self.assertEqual(captured["cpa_management_key"], "mgmt-key")
+        self.assertEqual(captured["cpa_oauth_state"], "cpa-state")
+        self.assertEqual(captured["session_token"], "session-token")
+        self.assertEqual(captured["access_token"], "access-token")
+
+    def test_sanitize_result_preserves_upload_failure_fields(self):
+        result = web_gui._sanitize_result(
+            {
+                "ok": True,
+                "phone": "+15551234567",
+                "session_token": "s" * 60,
+                "access_token": "a" * 60,
+                "uploaded": False,
+                "upload_error": "CPA upload failed",
+                "failed_upload_file": "failed_uploads/fail.json",
+                "upload_target": "cpa",
+            }
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["uploaded"])
+        self.assertEqual(result["upload_error"], "CPA upload failed")
+        self.assertEqual(result["failed_upload_file"], "failed_uploads/fail.json")
+        self.assertEqual(result["upload_target"], "cpa")
+        self.assertTrue(result["access_token"].endswith("..."))
+
+    def test_api_retry_failed_upload_calls_retry_function(self):
+        web_gui._state["config"] = {
+            "upload_target": "cpa",
+            "cpa": {"api_url": "https://cpa.example.com", "management_key": "key"},
+        }
+
+        with mock.patch("failed_uploads.retry_failed_upload", return_value={"ok": True}) as retry_mock:
+            with web_gui.app.test_client() as client:
+                resp = client.post("/api/failed-uploads/retry", json={"path": "failed_uploads/fail.json"})
+
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertTrue(data["ok"])
+        expected_path = (Path(web_gui.__file__).parent / "failed_uploads" / "fail.json").resolve()
+        retry_mock.assert_called_once_with(expected_path, web_gui._state["config"])
+
+    def test_api_retry_failed_upload_updates_matching_result_record(self):
+        results_dir = Path(web_gui.__file__).with_name("results")
+        failed_path = Path(web_gui.__file__).with_name("failed_uploads") / "test_retry_success.json"
+        result_path = results_dir / "test_failed_upload_result.json"
+        try:
+            web_gui._state["stats"] = web_gui._empty_stats()
+            results_dir.mkdir(exist_ok=True)
+            failed_path.parent.mkdir(exist_ok=True)
+            failed_path.write_text('{"phone":"+15550002222"}\n', encoding="utf-8")
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "phone_ok": True,
+                        "final_ok": False,
+                        "phone": "+15550002222",
+                        "bind_email": "retry@example.com",
+                        "failed_upload_file": str(failed_path),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch("failed_uploads.retry_failed_upload", return_value={"ok": True, "sub2api_account_id": "sub-123", "upload_target": "sub2api"}):
+                with web_gui.app.test_client() as client:
+                    resp = client.post("/api/failed-uploads/retry", json={"path": f"failed_uploads/{failed_path.name}"})
+
+            self.assertEqual(resp.status_code, 200)
+            data = resp.get_json()
+            self.assertTrue(data["ok"])
+            saved = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertTrue(saved["uploaded"])
+            self.assertTrue(saved["upload_verified"])
+            self.assertTrue(saved["final_ok"])
+            self.assertEqual(saved["status"], "final_ok")
+            self.assertEqual(saved["sub2api_id"], "sub-123")
+            self.assertEqual(web_gui._state["stats"]["current_success"], 1)
+            self.assertEqual(web_gui._state["stats"]["total_success"], 1)
+        finally:
+            for path in (failed_path, result_path):
+                if path.exists():
+                    path.unlink()
+
+    def test_api_results_list_hides_completed_phase2_records(self):
+        results_dir = Path(web_gui.__file__).with_name("results")
+        pending_path = results_dir / "test_results_list_pending.json"
+        done_path = results_dir / "test_results_list_done.json"
+        try:
+            results_dir.mkdir(exist_ok=True)
+            pending_path.write_text(
+                json.dumps({"ok": True, "phone_ok": True, "phone": "+15550005555", "final_ok": False}, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            done_path.write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "phone_ok": True,
+                        "phone": "+15550006666",
+                        "final_ok": True,
+                        "uploaded": True,
+                        "upload_verified": True,
+                        "sub2api_id": "sub-1",
+                        "needs_retry": True,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with web_gui.app.test_client() as client:
+                resp = client.get("/api/results-list?source=files")
+
+            self.assertEqual(resp.status_code, 200)
+            data = resp.get_json()
+            phones = {item["phone"] for item in data["items"]}
+            self.assertIn("+15550005555", phones)
+            self.assertNotIn("+15550006666", phones)
+        finally:
+            for path in (pending_path, done_path):
+                if path.exists():
+                    path.unlink()
+
+    def test_api_failed_uploads_list_returns_pending_files(self):
+        failed_dir = Path(web_gui.__file__).with_name("failed_uploads")
+        failed_path = failed_dir / "test_pending_failed_upload.json"
+        done_dir = failed_dir / "done"
+        done_path = done_dir / "test_done_failed_upload.json"
+        try:
+            failed_dir.mkdir(exist_ok=True)
+            done_dir.mkdir(exist_ok=True)
+            failed_path.write_text('{"phone":"+15550003333","email":"pending@example.com","upload_target":"sub2api"}\n', encoding="utf-8")
+            done_path.write_text('{"phone":"+15550004444","email":"done@example.com"}\n', encoding="utf-8")
+
+            with web_gui.app.test_client() as client:
+                resp = client.get("/api/failed-uploads/list")
+
+            self.assertEqual(resp.status_code, 200)
+            data = resp.get_json()
+            self.assertTrue(data["ok"])
+            names = [item["filename"] for item in data["items"]]
+            self.assertIn(failed_path.name, names)
+            self.assertNotIn(done_path.name, names)
+            item = next(item for item in data["items"] if item["filename"] == failed_path.name)
+            self.assertEqual(item["phone"], "+15550003333")
+            self.assertEqual(item["email"], "pending@example.com")
+        finally:
+            for path in (failed_path, done_path):
+                if path.exists():
+                    path.unlink()
+
+    def test_api_retry_failed_upload_rejects_paths_outside_failed_uploads(self):
+        with web_gui.app.test_client() as client:
+            resp = client.post("/api/failed-uploads/retry", json={"path": "config.json"})
+
+        self.assertEqual(resp.status_code, 400)
+        data = resp.get_json()
+        self.assertFalse(data["ok"])
+
     def test_api_outlook_pool_summary_and_list_classify_entries_from_local_data(self):
         with tempfile.TemporaryDirectory() as tmp:
             pool_path = Path(tmp) / "outlook.txt"
@@ -146,6 +835,7 @@ class WebGuiStatsTests(unittest.TestCase):
                         "verify@outlook.com----pw----cid----rt",
                         "reserved@outlook.com----pw----cid----rt",
                         "failed@outlook.com----pw----cid----rt",
+                        "pending-upload@outlook.com----pw----cid----rt",
                         "unused@outlook.com----pw----cid----rt",
                     ]
                 )
@@ -171,6 +861,23 @@ class WebGuiStatsTests(unittest.TestCase):
                         "phone": "+111",
                         "bind_email": "success@outlook.com",
                         "sub2api_id": "sub-111",
+                        "upload_verified": True,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (results_dir / "333_20260604_100700.json").write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "phone_ok": True,
+                        "final_ok": False,
+                        "phone": "+333",
+                        "bind_email": "pending-upload@outlook.com",
+                        "sub2api_id": "sub-pending",
+                        "upload_verified": False,
                     },
                     ensure_ascii=False,
                 )
@@ -236,14 +943,14 @@ class WebGuiStatsTests(unittest.TestCase):
 
             summary = summary_resp.get_json()
             self.assertTrue(summary["ok"])
-            self.assertEqual(summary["total"], 6)
+            self.assertEqual(summary["total"], 7)
             self.assertEqual(
                 summary["counts"],
                 {
                     "unused": 1,
                     "reserved": 1,
                     "success": 1,
-                    "register_failed": 1,
+                    "register_failed": 2,
                     "verify_failed": 1,
                     "bad": 1,
                 },
@@ -258,6 +965,7 @@ class WebGuiStatsTests(unittest.TestCase):
             self.assertEqual(by_email["bad@outlook.com"]["status"], "bad")
             self.assertEqual(by_email["verify@outlook.com"]["status"], "verify_failed")
             self.assertEqual(by_email["failed@outlook.com"]["status"], "register_failed")
+            self.assertEqual(by_email["pending-upload@outlook.com"]["status"], "register_failed")
             self.assertEqual(by_email["unused@outlook.com"]["status"], "unused")
             self.assertTrue(by_email["success@outlook.com"]["has_result"])
             self.assertTrue(by_email["failed@outlook.com"]["has_result"])

@@ -147,10 +147,12 @@ python auto_register.py -n 5 --country 151 --max-price 0.039
 
 # Web GUI
 python auto_register.py --gui
-# 浏览器打开 http://127.0.0.1:7777
+# 浏览器打开 http://127.0.0.1:7778
 ```
 
 ### Phase 2: OAuth 登录 + 绑邮箱 + 上传 SUB2API
+
+使用 Outlook 作为邮箱提供方时，`outlook.txt` 是长期凭据库，不是“未使用邮箱列表”。已经绑定到账号的 Outlook 邮箱仍可能在历史 Phase 2 补跑时接收邮箱验证码，所以不要删除已用邮箱凭据；只需要继续追加新邮箱，并让 `outlook_used.txt` 记录 used/reserved/success 等状态来避免新任务重复分配。
 
 ```bash
 # 从 SUB2API 生成 OAuth URL

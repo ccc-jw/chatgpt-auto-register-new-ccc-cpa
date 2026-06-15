@@ -102,12 +102,14 @@ def _extract_code(text: str, excluded: Set[str]) -> Optional[str]:
 def _used_emails(path: Path) -> Set[str]:
     if not path.exists():
         return set()
-    used = set()
+    latest = {}
     for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
         match = EMAIL_RE.search(line)
         if match:
-            used.add(match.group(0).lower())
-    return used
+            status = line.split()[-1] if line.split() else "used"
+            latest[match.group(0).lower()] = status.strip().lower()
+    reusable_statuses = {"register_failed", "verify_failed", "bad"}
+    return {email for email, status in latest.items() if status not in reusable_statuses}
 
 
 def load_outlook_accounts(path: str = "outlook.txt") -> List[OutlookAccount]:
@@ -158,13 +160,38 @@ def reserve_next_outlook(
         raise RuntimeError(f"No unused Outlook accounts left in {_pool_source_label(pool_path)}")
 
 
-def get_outlook_account(email: str, pool_path: str = "outlook.txt") -> OutlookAccount:
+def get_outlook_account(
+    email: str,
+    pool_path: str = "outlook.txt",
+    used_path: str = "outlook_used.txt",
+) -> OutlookAccount:
     target = (email or "").strip().lower()
     if not target:
         raise ValueError("Outlook email is required")
+
+    # Search in the main pool (includes inline pool text)
     for account in load_outlook_accounts(pool_path):
         if account.email.lower() == target:
             return account
+
+    # If not found in main pool, check if it's in the used file
+    # This can happen when the account was used in a previous registration
+    # but we still need to receive verification emails for 补跑
+    used_file = _repo_path(used_path)
+    if used_file.exists():
+        lines = used_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+        for line in lines:
+            parts = line.strip().split("\t")
+            if len(parts) >= 2:
+                used_email = parts[1].strip().lower()
+                if used_email == target:
+                    # Email is in used file but not in pool
+                    # This means the account data is not available
+                    raise RuntimeError(
+                        f"Outlook account {email} was already used and is not in the pool. "
+                        f"Please add it back to outlook.txt pool or use a different email."
+                    )
+
     raise RuntimeError(f"Outlook account not found in pool: {email}")
 
 
