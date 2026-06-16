@@ -149,6 +149,124 @@ class UnifiedSMS:
         except Exception:
             pass
 
+    def _extract_country_name(self, *items) -> str:
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            for key in ("country_name", "countryName", "chn", "eng", "name", "title", "rus"):
+                value = item.get(key)
+                if value not in (None, ""):
+                    return str(value)
+        return ""
+
+    def _country_names(self) -> dict[str, str]:
+        payloads = [
+            {"api_key": self.api_key, "action": "getCountries"},
+            {"action": "getCountries"},
+        ]
+        data = None
+        for params in payloads:
+            try:
+                r = requests.get(
+                    self._base_url,
+                    params=params,
+                    timeout=15,
+                    verify=True,
+                )
+                data = r.json()
+                break
+            except Exception:
+                continue
+        if isinstance(data, dict) and isinstance(data.get("data"), dict):
+            data = data["data"]
+        if not isinstance(data, dict):
+            return {}
+        names = {}
+        for country, info in data.items():
+            name = self._extract_country_name(info)
+            if name:
+                names[str(country)] = name
+        return names
+
+    def get_price_catalog(self, service: str = "dr") -> List[dict]:
+        country_names = self._country_names()
+        if self.provider == "smsbower":
+            r = requests.get(
+                self._base_url,
+                params={"api_key": self.api_key, "action": "getPricesV3", "service": service},
+                timeout=15,
+                verify=True,
+            )
+            data = r.json()
+            rows = []
+            for country, services in data.items():
+                providers = (services or {}).get(service, {})
+                price_counts = {}
+                country_name = self._extract_country_name(services) or country_names.get(str(country), "")
+                for info in providers.values():
+                    if not country_name:
+                        country_name = self._extract_country_name(info) or country_names.get(str(country), "")
+                    try:
+                        price = float(info.get("price", 999))
+                    except (TypeError, ValueError):
+                        continue
+                    if price <= 0 or price >= 999:
+                        continue
+                    try:
+                        count = int(info.get("count", 0) or 0)
+                    except (TypeError, ValueError):
+                        count = 0
+                    price_counts[price] = price_counts.get(price, 0) + count
+                if not price_counts:
+                    continue
+                unique_prices = sorted(price_counts.keys())
+                lowest_price = unique_prices[0]
+                second_price = unique_prices[1] if len(unique_prices) > 1 else None
+                rows.append(
+                    {
+                        "sms_provider": self.provider,
+                        "country": str(country),
+                        "country_name": country_name,
+                        "lowest_price": lowest_price,
+                        "second_price": second_price,
+                        "lowest_count": price_counts.get(lowest_price, 0),
+                        "second_count": price_counts.get(second_price, 0) if second_price is not None else 0,
+                    }
+                )
+            rows.sort(key=lambda row: (row["lowest_price"], row["country"]))
+            return rows
+        if self.provider == "hero-sms":
+            r = requests.get(
+                self._base_url,
+                params={"api_key": self.api_key, "action": "getPrices", "service": service},
+                timeout=15,
+                verify=True,
+            )
+            data = r.json()
+            rows = []
+            for country, services in data.items():
+                info = (services or {}).get(service, {})
+                try:
+                    price = float(info.get("cost", 0))
+                except (TypeError, ValueError):
+                    continue
+                if price <= 0:
+                    continue
+                rows.append(
+                    {
+                        "sms_provider": self.provider,
+                        "country": str(country),
+                        "country_name": self._extract_country_name(info, services) or country_names.get(str(country), ""),
+                        "lowest_price": price,
+                        "second_price": None,
+                        "lowest_count": int(info.get("count", 0) or 0),
+                        "second_count": 0,
+                    }
+                )
+            rows.sort(key=lambda row: (row["lowest_price"], row["country"]))
+            return rows
+        return []
+
     def get_sorted_countries_by_price(self, countries: List[str], service: str = "dr") -> List[dict]:
         """Query price for each country and return sorted by cheapest price first.
         Returns list of [{"country": "4", "price": 0.025}, ...] sorted ascending.

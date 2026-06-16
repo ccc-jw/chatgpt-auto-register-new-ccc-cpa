@@ -221,6 +221,212 @@ class WebGuiStatsTests(unittest.TestCase):
 
 
 
+    def test_main_page_has_save_config_button(self):
+        with web_gui.app.test_client() as client:
+            resp = client.get("/")
+
+        self.assertEqual(resp.status_code, 200)
+        html = resp.data.decode("utf-8")
+        self.assertIn("保存配置", html)
+        self.assertIn("onclick=\"saveConfigOnly()\"", html)
+
+    def test_main_page_has_in_page_sms_price_check_view(self):
+        with web_gui.app.test_client() as client:
+            resp = client.get("/")
+
+        self.assertEqual(resp.status_code, 200)
+        html = resp.data.decode("utf-8")
+        self.assertIn("id=\"view-sms-price-check\"", html)
+        self.assertIn("id=\"nav-sms-price-check\"", html)
+        self.assertIn("switchView(&quot;sms-price-check&quot;)", html)
+        self.assertNotIn("location.href='/sms-price-check'", html)
+        self.assertIn("function loadSmsPriceCheck", html)
+        self.assertIn("<select data-filter=\"sms_provider\"", html)
+        self.assertIn("<select data-filter=\"country\"", html)
+        self.assertNotIn("data-filter=\"in_purchase_pool\"", html)
+        self.assertNotIn("data-filter=\"recommendation\"", html)
+        self.assertNotIn("data-filter=\"success_price\"", html)
+        self.assertNotIn("data-filter=\"success_count\"", html)
+
+    def test_sms_price_check_page_exists_with_two_filterable_tables(self):
+        with web_gui.app.test_client() as client:
+            resp = client.get("/sms-price-check")
+
+        self.assertEqual(resp.status_code, 200)
+        html = resp.data.decode("utf-8")
+        self.assertIn("短信价格检查", html)
+        self.assertIn("触发价格检查", html)
+        self.assertIn("国家/地区id", html)
+        self.assertIn("国家/地区名称", html)
+        self.assertIn("成功价格统计", html)
+        self.assertIn("data-filter=\"sms_provider\"", html)
+        self.assertIn("data-filter=\"country\"", html)
+        self.assertIn("<select data-filter=\"sms_provider\"", html)
+        self.assertIn("<select data-filter=\"country\"", html)
+        self.assertIn("data-sort=\"number\"", html)
+        self.assertNotIn("lowest_price\" placeholder=\"筛选\"", html)
+        self.assertNotIn("second_price\" placeholder=\"筛选\"", html)
+        self.assertNotIn("lowest_count\" placeholder=\"筛选\"", html)
+        self.assertNotIn("second_count\" placeholder=\"筛选\"", html)
+        self.assertNotIn("data-filter=\"in_purchase_pool\"", html)
+        self.assertNotIn("data-filter=\"recommendation\"", html)
+        self.assertNotIn("data-filter=\"success_price\"", html)
+        self.assertNotIn("data-filter=\"success_count\"", html)
+
+    def test_main_page_sms_price_tables_use_compact_header_filters(self):
+        with web_gui.app.test_client() as client:
+            resp = client.get("/")
+
+        self.assertEqual(resp.status_code, 200)
+        html = resp.data.decode("utf-8")
+        self.assertIn(".sms-price-table th{background:rgba(243,239,228,.85);", html)
+        self.assertIn("font-weight:500", html)
+        self.assertIn(".sms-price-table th select{display:inline-block;width:92px", html)
+        self.assertIn("margin:0 0 0 8px", html)
+        self.assertIn("padding:3px 18px 3px 8px", html)
+        self.assertIn(".nav-links{display:flex;align-items:center;margin-left:auto", html)
+        self.assertIn(".nav-secondary{display:flex", html)
+        self.assertIn("id=\"nav-download-results\"", html)
+
+    def test_sms_price_check_api_hides_sensitive_config(self):
+        web_gui._state["config"] = {
+            "sms": {
+                "provider": "smsbower",
+                "api_key": "secret-sms-key",
+                "countries": ["4"],
+                "service": "dr",
+                "max_price": "0.03",
+            },
+            "sub2api": {"pwd": "secret-sub2api-password"},
+        }
+
+        class FakeSMS:
+            def __init__(self, provider, api_key):
+                self.provider = provider
+                self.api_key = api_key
+
+            def get_price_catalog(self, service="dr"):
+                return [
+                    {
+                        "sms_provider": self.provider,
+                        "country": "4",
+                        "country_name": "United States",
+                        "lowest_price": 0.02,
+                        "second_price": 0.03,
+                        "lowest_count": 1,
+                        "second_count": 2,
+                    }
+                ]
+
+        with mock.patch.object(web_gui, "UnifiedSMS", FakeSMS):
+            with mock.patch.object(web_gui, "load_success_price_rows", return_value=[]):
+                with web_gui.app.test_client() as client:
+                    resp = client.get("/api/sms-price-check")
+
+        self.assertEqual(resp.status_code, 200)
+        payload = resp.get_json()
+        self.assertTrue(payload["ok"])
+        raw = json.dumps(payload, ensure_ascii=False)
+        self.assertNotIn("secret-sms-key", raw)
+        self.assertNotIn("secret-sub2api-password", raw)
+        self.assertEqual(payload["configured_countries"]["smsbower"], ["4"])
+        self.assertEqual(payload["price_rows"][0]["recommendation"], "已在池中")
+        self.assertEqual(payload["price_rows"][0]["country_name"], "United States")
+        self.assertEqual(payload["success_rows"], [])
+
+    def test_api_config_saves_only_active_sms_provider(self):
+        CONFIG_FILE.write_text(
+            json.dumps(
+                {
+                    "sms": {
+                        "active_provider": "hero-sms",
+                        "providers": {
+                            "hero-sms": {"api_key": "hero-old", "countries": ["4"], "service": "dr", "operator": "any", "max_price": "0.025"},
+                            "smsbower": {"api_key": "bower-old", "countries": ["151"], "service": "dr", "operator": "any", "max_price": "0.03"},
+                        },
+                    },
+                    "register": {"password": "", "name": "A", "birthdate": "2000-01-01"},
+                },
+                ensure_ascii=False,
+            ) + "\n",
+            encoding="utf-8",
+        )
+
+        with web_gui.app.test_client() as client:
+            resp = client.post("/api/config", json={"sms_provider": "smsbower", "api_key": "bower-new", "countries": "33,151", "max_price": "0.02"})
+            self.assertEqual(resp.status_code, 200)
+            data = resp.get_json()
+
+        sms = data["config"]["sms"]
+        self.assertEqual(sms["active_provider"], "smsbower")
+        self.assertEqual(sms["provider"], "smsbower")
+        self.assertEqual(sms["api_key"], "bower-new")
+        self.assertEqual(sms["countries"], ["33", "151"])
+        self.assertEqual(sms["providers"]["smsbower"]["api_key"], "bower-new")
+        self.assertEqual(sms["providers"]["smsbower"]["countries"], ["33", "151"])
+        self.assertEqual(sms["providers"]["hero-sms"]["api_key"], "hero-old")
+        self.assertEqual(sms["providers"]["hero-sms"]["countries"], ["4"])
+
+    def test_main_page_navigation_keeps_primary_menu_visible_and_download_right(self):
+        with web_gui.app.test_client() as client:
+            resp = client.get("/")
+
+        self.assertEqual(resp.status_code, 200)
+        html = resp.data.decode("utf-8")
+        self.assertIn("<div class=\"nav-primary\"", html)
+        self.assertIn("<div class=\"nav-secondary\"", html)
+        self.assertIn("id=\"nav-download-results\"", html)
+        self.assertIn(".nav-primary{display:flex", html)
+        self.assertIn(".nav-secondary{display:flex", html)
+        self.assertIn(".nav-links{display:flex;align-items:center;margin-left:auto", html)
+        self.assertIn("<span class=\"brand-meta\" id=\"status-msg\">就绪</span>\n    <nav class=\"nav-links\">", html)
+        self.assertLess(html.index("id=\"status-msg\""), html.index("<nav class=\"nav-links\">"))
+        self.assertLess(html.index("<nav class=\"nav-links\">"), html.index("id=\"nav-download-results\""))
+        self.assertNotIn("nav-spacer", html)
+
+    def test_main_page_has_provider_switch_loader(self):
+        with web_gui.app.test_client() as client:
+            resp = client.get("/")
+
+        self.assertEqual(resp.status_code, 200)
+        html = resp.data.decode("utf-8")
+        self.assertIn("function applySmsProviderConfig", html)
+        self.assertIn("onchange=\"applySmsProviderConfig()\"", html)
+
+    def test_sms_price_check_api_queries_all_configured_sms_providers(self):
+        web_gui._state["config"] = {
+            "sms": {
+                "active_provider": "hero-sms",
+                "provider": "hero-sms",
+                "providers": {
+                    "hero-sms": {"api_key": "hero-key", "countries": ["4"], "service": "dr", "operator": "any", "max_price": "0.03"},
+                    "smsbower": {"api_key": "bower-key", "countries": ["151"], "service": "dr", "operator": "any", "max_price": "0.02"},
+                },
+            }
+        }
+
+        class FakeSMS:
+            def __init__(self, provider, api_key):
+                self.provider = provider
+                self.api_key = api_key
+
+            def get_price_catalog(self, service="dr"):
+                return [{"sms_provider": self.provider, "country": "4" if self.provider == "hero-sms" else "151", "lowest_price": 0.02, "second_price": None, "lowest_count": 3, "second_count": 0}]
+
+        with mock.patch.object(web_gui, "UnifiedSMS", FakeSMS):
+            with mock.patch.object(web_gui, "load_success_price_rows", return_value=[]):
+                with web_gui.app.test_client() as client:
+                    resp = client.get("/api/sms-price-check")
+
+        payload = resp.get_json()
+        self.assertTrue(payload["ok"])
+        providers = {row["sms_provider"] for row in payload["price_rows"]}
+        self.assertEqual(providers, {"hero-sms", "smsbower"})
+        by_provider = {row["sms_provider"]: row for row in payload["price_rows"]}
+        self.assertTrue(by_provider["hero-sms"]["in_purchase_pool"])
+        self.assertTrue(by_provider["smsbower"]["in_purchase_pool"])
+
+
     def test_auto_retry_phase2_on_startup_skips_when_config_disables_it(self):
         web_gui._state["config"] = {"phase2_auto_skip": False}
         entries = []

@@ -17,3 +17,4 @@ outlook_pool*.json
 email_pool*.json
 outlook.txt
 outlook_used.txt
+sms_success_prices.json

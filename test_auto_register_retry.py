@@ -181,7 +181,7 @@ class AutoRegisterRetryTests(unittest.TestCase):
         sms = FakeSms(country_failures={"151": 100, "4": 0})
 
         with patch.object(ar._time, "sleep", return_value=None):
-            aid, phone, country = ar._get_number_with_retry(
+            aid, phone, country, sms_price = ar._get_number_with_retry(
                 sms,
                 service="dr",
                 countries=["151", "4"],
@@ -198,7 +198,7 @@ class AutoRegisterRetryTests(unittest.TestCase):
         sms = FakeSms(country_failures={"151": 100, "4": 100, "16": 100})
 
         with patch.object(ar._time, "sleep", return_value=None):
-            aid, phone, country = ar._get_number_with_retry(
+            aid, phone, country, sms_price = ar._get_number_with_retry(
                 sms,
                 service="dr",
                 countries=["151", "4", "16"],
@@ -219,7 +219,7 @@ class AutoRegisterRetryTests(unittest.TestCase):
         )
 
         with patch.object(ar._time, "sleep", return_value=None):
-            aid, phone, country = ar._get_number_with_retry(
+            aid, phone, country, sms_price = ar._get_number_with_retry(
                 sms,
                 service="dr",
                 countries=["151", "4"],
@@ -241,7 +241,7 @@ class AutoRegisterRetryTests(unittest.TestCase):
         )
 
         with patch.object(ar._time, "sleep", return_value=None):
-            aid, phone, country = ar._get_number_with_retry(
+            aid, phone, country, sms_price = ar._get_number_with_retry(
                 sms,
                 service="dr",
                 countries=["151", "4"],
@@ -253,6 +253,71 @@ class AutoRegisterRetryTests(unittest.TestCase):
         self.assertNotIn("151", sms.calls_by_country)
         self.assertEqual(sms.number_call_kwargs[0]["provider_ids"], "p4")
         self.assertEqual(sms.number_call_kwargs[0]["max_price"], "0.015")
+    def test_register_one_records_sms_price_on_phone_success(self):
+        sms = FakeSms(cheapest_prices={"33": ("p33", 0.027)})
+
+        with patch.object(ar, "ChatGPTRegister", FakeRegister), patch.object(ar._time, "sleep", return_value=None):
+            result = ar.register_one(sms, self.config, verbose=False, no_phase2=True)
+
+        self.assertTrue(result["phone_ok"])
+        self.assertEqual(result["sms_price"], "0.027")
+    def test_load_config_migrates_legacy_sms_config_into_providers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "sms": {
+                            "provider": "hero-sms",
+                            "api_key": "hero-key",
+                            "countries": ["4", "16"],
+                            "service": "dr",
+                            "operator": "any",
+                            "max_price": "0.025",
+                        },
+                        "register": {"password": "pw", "name": "A", "birthdate": "2000-01-01"},
+                    },
+                    ensure_ascii=False,
+                ) + "\n",
+                encoding="utf-8",
+            )
+
+            cfg = ar.load_config(str(path))
+
+        self.assertEqual(cfg["sms"]["active_provider"], "hero-sms")
+        self.assertEqual(cfg["sms"]["provider"], "hero-sms")
+        self.assertEqual(cfg["sms"]["api_key"], "hero-key")
+        self.assertEqual(cfg["sms"]["countries"], ["4", "16"])
+        self.assertEqual(cfg["sms"]["providers"]["hero-sms"]["api_key"], "hero-key")
+        self.assertEqual(cfg["sms"]["providers"]["hero-sms"]["countries"], ["4", "16"])
+        self.assertIn("smsbower", cfg["sms"]["providers"])
+
+    def test_load_config_uses_active_provider_from_providers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "sms": {
+                            "active_provider": "smsbower",
+                            "providers": {
+                                "smsbower": {"api_key": "bower-key", "countries": ["151"], "service": "dr", "operator": "any", "max_price": "0.03"},
+                                "hero-sms": {"api_key": "hero-key", "countries": ["4"], "service": "dr", "operator": "any", "max_price": "0.025"},
+                            },
+                        },
+                        "register": {"password": "pw", "name": "A", "birthdate": "2000-01-01"},
+                    },
+                    ensure_ascii=False,
+                ) + "\n",
+                encoding="utf-8",
+            )
+
+            cfg = ar.load_config(str(path))
+
+        self.assertEqual(cfg["sms"]["provider"], "smsbower")
+        self.assertEqual(cfg["sms"]["api_key"], "bower-key")
+        self.assertEqual(cfg["sms"]["countries"], ["151"])
+        self.assertEqual(cfg["sms"]["max_price"], "0.03")
 
 
 if __name__ == "__main__":

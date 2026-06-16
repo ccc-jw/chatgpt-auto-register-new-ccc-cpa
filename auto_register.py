@@ -26,8 +26,22 @@ from typing import Tuple
 
 from chatgpt_register import ChatGPTRegister
 from phone_sms_adapter import StopRequested, UnifiedSMS, parse_countries
+from sms_price_check import load_success_price_rows, record_success_price, save_success_price_rows
 
-# ============================================================
+
+_SMS_SUCCESS_PRICE_FILE = Path(__file__).parent / "sms_success_prices.json"
+
+
+def _record_sms_success_price(sms_provider: str, country: str, success_price):
+    if not sms_provider or not country or success_price in (None, ""):
+        return
+    try:
+        rows = load_success_price_rows(_SMS_SUCCESS_PRICE_FILE)
+        rows = record_success_price(rows, sms_provider, country, success_price)
+        save_success_price_rows(_SMS_SUCCESS_PRICE_FILE, rows)
+    except Exception:
+        pass
+
 # 随机资料
 # ============================================================
 
@@ -116,7 +130,7 @@ def _get_number_with_retry(
     verbose: bool = True,
     retry_delay: int = 2,
     stop_requested=None,
-) -> Tuple[str, str, str]:
+) -> Tuple[str, str, str, str]:
     """Retry getting a phone number forever: 100 attempts per country, then rotate."""
     if not countries:
         raise ValueError("countries list is empty — cannot get phone number without a country")
@@ -176,7 +190,7 @@ def _get_number_with_retry(
                         provider_ids=country_provider_ids,
                         max_price=country_max_price,
                     )
-                    return aid, phone, country
+                    return aid, phone, country, country_max_price
                 except Exception as e:
                     if stop_requested and stop_requested():
                         raise StopRequested("stopped while waiting for phone number")
@@ -217,6 +231,57 @@ def _fail_result(phone: str, failure_stage: str, error: str, sms_provider: str =
     }
 
 DEFAULT_SMS_MAX_PRICE = "0.03"
+_SUPPORTED_SMS_PROVIDERS = ("smsbower", "hero-sms")
+
+
+def _default_sms_provider_config(provider: str) -> dict:
+    return {
+        "api_key": "",
+        "countries": [],
+        "service": "dr",
+        "operator": "any",
+        "max_price": DEFAULT_SMS_MAX_PRICE,
+    }
+
+
+def _normalize_sms_config(sms_cfg: dict, legacy_found: dict = None) -> dict:
+    legacy_found = legacy_found or {}
+    active_provider = str(sms_cfg.get("active_provider") or sms_cfg.get("provider") or "smsbower")
+    if active_provider not in _SUPPORTED_SMS_PROVIDERS:
+        active_provider = "smsbower"
+
+    raw_providers = sms_cfg.get("providers") or {}
+    providers = {}
+    for provider in _SUPPORTED_SMS_PROVIDERS:
+        provider_cfg = _default_sms_provider_config(provider)
+        provider_cfg.update(dict(raw_providers.get(provider) or {}))
+        provider_cfg["countries"] = parse_countries(provider_cfg.get("countries"))
+        provider_cfg["max_price"] = str(provider_cfg.get("max_price") or DEFAULT_SMS_MAX_PRICE)
+        providers[provider] = provider_cfg
+
+    active_provider_cfg = providers[active_provider]
+    for key in ("api_key", "countries", "service", "operator", "max_price"):
+        if key in sms_cfg and sms_cfg.get(key) not in (None, "", []):
+            active_provider_cfg[key] = sms_cfg[key]
+    active_provider_cfg["countries"] = parse_countries(active_provider_cfg.get("countries"))
+    active_provider_cfg["max_price"] = str(active_provider_cfg.get("max_price") or DEFAULT_SMS_MAX_PRICE)
+
+    if "smsbower" in legacy_found:
+        providers["smsbower"]["api_key"] = legacy_found["smsbower"].get("api_key", providers["smsbower"].get("api_key", ""))
+        if legacy_found.get("country") and not providers["smsbower"].get("countries"):
+            providers["smsbower"]["countries"] = parse_countries(legacy_found.get("country"))
+
+    current = dict(providers[active_provider])
+    return {
+        "active_provider": active_provider,
+        "provider": active_provider,
+        "providers": providers,
+        "api_key": current.get("api_key", ""),
+        "countries": parse_countries(current.get("countries")),
+        "service": current.get("service", "dr"),
+        "operator": current.get("operator", "any"),
+        "max_price": str(current.get("max_price") or DEFAULT_SMS_MAX_PRICE),
+    }
 
 
 # ============================================================
@@ -245,16 +310,9 @@ def load_config(path: str = None) -> dict:
         if p and Path(p).exists():
             with open(p, "r", encoding="utf-8") as f:
                 found = json.load(f)
-            # New sms.* config
             if "sms" in found:
-                sms_cfg = found["sms"]
-                for k in ["provider", "api_key", "countries", "service", "operator", "max_price"]:
-                    if k in sms_cfg:
-                        config["sms"][k] = sms_cfg[k]
-                if isinstance(config["sms"]["countries"], str):
-                    config["sms"]["countries"] = [c.strip() for c in config["sms"]["countries"].split(",") if c.strip()]
+                config["sms"] = dict(found["sms"])
             elif "smsbower" in found:
-                # Legacy: smsbower.api_key
                 config["sms"]["api_key"] = found["smsbower"].get("api_key", "")
                 config["sms"]["provider"] = "smsbower"
                 old_country = found.get("country", "")
@@ -282,6 +340,7 @@ def load_config(path: str = None) -> dict:
             break
     if os.environ.get("SMSBOWER_KEY"):
         config["sms"]["api_key"] = os.environ["SMSBOWER_KEY"]
+    config["sms"] = _normalize_sms_config(config.get("sms", {}), found)
     proxy_env = os.environ.get("PROXY") or os.environ.get("HTTPS_PROXY")
     if proxy_env:
         config["proxy"] = proxy_env
@@ -330,6 +389,7 @@ def register_one(
     quota_charged = False
     sms_provider = sms.provider
     used_country = ""
+    sms_price = ""
 
     password = reg_cfg["password"] or random_password()
     name = reg_cfg.get("name") or random_name()
@@ -347,7 +407,7 @@ def register_one(
         # ── 阶段 1: 获取手机号 ──
         if verbose:
             print(f"  [阶段] 获取手机号 provider={sms.provider} countries={countries}")
-        aid, phone_raw, used_country = _get_number_with_retry(
+        aid, phone_raw, used_country, sms_price = _get_number_with_retry(
             sms,
             service=service,
             countries=countries,
@@ -504,6 +564,7 @@ def register_one(
 
         if verbose:
             print(f"  [完成] 手机号阶段成功 phone={phone} provider={sms_provider} country={used_country} final_ok={final_ok}")
+        _record_sms_success_price(sms_provider, used_country, sms_price)
 
         return {
             "ok": final_ok, "phone": phone, "password": password,
@@ -514,7 +575,7 @@ def register_one(
             "email_selected": email_selected, "email_bound": email_bound, "uploaded": uploaded,
             "final_ok": final_ok, "status": status, "failure_stage": failure_stage,
             "retryable": retryable, "quota_charged": quota_charged,
-            "sms_provider": sms_provider, "country": used_country,
+            "sms_provider": sms_provider, "country": used_country, "sms_price": sms_price,
         }
 
     except StopRequested:

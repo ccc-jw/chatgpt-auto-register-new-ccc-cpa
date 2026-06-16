@@ -13,6 +13,7 @@ app = Flask(__name__)
 sys.path.insert(0, str(Path(__file__).parent))
 from smsbower import SmsBower
 from phone_sms_adapter import UnifiedSMS, parse_countries
+from sms_price_check import build_price_rows, load_success_price_rows
 import auto_register as ar
 from outlook_mail import (
     OutlookMailClient,
@@ -215,11 +216,56 @@ def _log(msg, tag="info", thread_id=None):
 def index():
     return Response(_HTML, mimetype="text/html; charset=utf-8")
 
+@app.route("/sms-price-check")
+def sms_price_check_page():
+    return Response(_SMS_PRICE_CHECK_HTML, mimetype="text/html; charset=utf-8")
+
+@app.route("/api/sms-price-check")
+def api_sms_price_check():
+    cfg = _state.get("config") or ar.load_config()
+    sms_cfg = ar._normalize_sms_config((cfg.get("sms") or {}))
+    providers = sms_cfg.get("providers", {})
+    success_path = Path(__file__).parent / "sms_success_prices.json"
+    errors = []
+    success_rows = []
+    price_rows = []
+    try:
+        success_rows = load_success_price_rows(success_path)
+    except Exception as e:
+        errors.append(f"成功价格统计读取失败: {e}")
+    for provider, provider_cfg in providers.items():
+        key = provider_cfg.get("api_key", "")
+        if not key:
+            continue
+        try:
+            price_catalog = UnifiedSMS(provider=provider, api_key=key).get_price_catalog(service=provider_cfg.get("service", "dr"))
+            provider_price_rows = build_price_rows(price_catalog, parse_countries(provider_cfg.get("countries", [])), success_rows, provider_cfg.get("max_price", ar.DEFAULT_SMS_MAX_PRICE))
+            price_rows.extend(provider_price_rows)
+        except Exception as e:
+            errors.append(f"{provider} 价格查询失败: {e}")
+    country_names = {(row.get("sms_provider", ""), row.get("country", "")): row.get("country_name", "") for row in price_rows}
+    success_rows = [dict(row, country_name=country_names.get((row.get("sms_provider", ""), row.get("country", "")), "")) for row in success_rows]
+    return jsonify({
+        "ok": not bool(errors),
+        "price_rows": price_rows,
+        "success_rows": success_rows,
+        "configured_countries": {provider: parse_countries(provider_cfg.get("countries", [])) for provider, provider_cfg in providers.items()},
+        "errors": errors,
+    })
+
 @app.route("/api/config", methods=["GET", "POST"])
 def api_config():
     if request.method == "POST":
         d = request.json or {}
         cfg = ar.load_config()
+        active_provider = str(d.get("sms_provider") or cfg.get("sms", {}).get("active_provider") or cfg.get("sms", {}).get("provider") or "smsbower")
+        if active_provider not in ar._SUPPORTED_SMS_PROVIDERS:
+            active_provider = "smsbower"
+        cfg["sms"] = ar._normalize_sms_config(cfg.get("sms", {}))
+        cfg["sms"].setdefault("providers", {})
+        cfg["sms"].setdefault("active_provider", active_provider)
+        cfg["sms"]["providers"].setdefault(active_provider, ar._default_sms_provider_config(active_provider))
+        active_sms = cfg["sms"]["providers"][active_provider]
         for k in ["sms_provider", "api_key", "countries", "service", "password", "max_price", "code_timeout",
                    "sms_timeout", "imap_user", "imap_pass", "sub2api_url", "sub2api_email",
                    "sub2api_pwd", "sub2api_group", "sub2api_proxy_id", "bind_email", "icloud_cookies",
@@ -229,13 +275,14 @@ def api_config():
                 "plus_country", "plus_currency", "proxy",
                 "upload_target", "cpa_management_url", "cpa_api_url", "cpa_management_key", "cpa_upload_mode"]:
             if k in d:
-                if k == "sms_provider": cfg["sms"]["provider"] = d[k]
-                elif k == "api_key": cfg["sms"]["api_key"] = d[k]
-                elif k == "countries": cfg["sms"]["countries"] = [c.strip() for c in d[k].split(",") if c.strip()]
+                if k == "sms_provider":
+                    cfg["sms"]["active_provider"] = active_provider
+                elif k == "api_key": active_sms["api_key"] = d[k]
+                elif k == "countries": active_sms["countries"] = [c.strip() for c in d[k].split(",") if c.strip()]
                 elif k in ("code_timeout", "sms_timeout"): cfg[k] = int(d[k]) if d[k] else 30
                 elif k == "password": cfg["register"]["password"] = d[k]
-                elif k == "service": cfg["sms"][k] = d[k]
-                elif k == "max_price": cfg["sms"]["max_price"] = str(d[k]).strip() or ar.DEFAULT_SMS_MAX_PRICE
+                elif k == "service": active_sms[k] = d[k]
+                elif k == "max_price": active_sms["max_price"] = str(d[k]).strip() or ar.DEFAULT_SMS_MAX_PRICE
                 elif k == "proxy": cfg["proxy"] = d[k]
                 elif k == "imap_user": cfg["icloud"] = cfg.get("icloud", {}); cfg["icloud"]["user"] = d[k]
                 elif k == "imap_pass": cfg["icloud"] = cfg.get("icloud", {}); cfg["icloud"]["pass"] = d[k]
@@ -264,8 +311,17 @@ def api_config():
                 elif k == "cpa_api_url": cfg["cpa"] = cfg.get("cpa", {}); cfg["cpa"]["api_url"] = d[k]
                 elif k == "cpa_management_key": cfg["cpa"] = cfg.get("cpa", {}); cfg["cpa"]["management_key"] = d[k]
                 elif k == "cpa_upload_mode": cfg["cpa"] = cfg.get("cpa", {}); cfg["cpa"]["upload_mode"] = d[k] or "auto"
-        if not str(cfg["sms"].get("max_price", "")).strip():
-            cfg["sms"]["max_price"] = ar.DEFAULT_SMS_MAX_PRICE
+        active_sms["max_price"] = str(active_sms.get("max_price") or ar.DEFAULT_SMS_MAX_PRICE).strip() or ar.DEFAULT_SMS_MAX_PRICE
+        active_sms["countries"] = parse_countries(active_sms.get("countries", []))
+        cfg["sms"].update({
+            "active_provider": active_provider,
+            "provider": active_provider,
+            "api_key": active_sms.get("api_key", ""),
+            "countries": active_sms.get("countries", []),
+            "service": active_sms.get("service", "dr"),
+            "operator": active_sms.get("operator", "any"),
+            "max_price": active_sms.get("max_price", ar.DEFAULT_SMS_MAX_PRICE),
+        })
         # Also write to legacy fields for runner.py backward compatibility
         cfg["sms_provider"] = cfg["sms"].get("provider", "smsbower")
         cfg["sms_api_key"] = cfg["sms"].get("api_key", "")
@@ -2268,6 +2324,63 @@ def start_gui(host="0.0.0.0", port=7778):
 
 
 
+_SMS_PRICE_CHECK_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>短信价格检查</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f7f1e8;color:#3b2a1d;margin:0;padding:24px}
+.card{background:#fffaf3;border:1px solid #dcc7a8;border-radius:8px;padding:16px;margin-bottom:18px;box-shadow:0 2px 8px rgba(60,40,20,.06)}
+h1{margin:0 0 16px;font-size:24px}h2{font-size:17px;margin:0 0 12px}.toolbar{display:flex;gap:8px;align-items:center;margin-bottom:12px}
+button{border:1px solid #b98a53;background:#fff3df;color:#3b2a1d;border-radius:4px;padding:7px 12px;cursor:pointer}button:hover{background:#ffe7bf}
+.error{color:#a33;font-size:13px;margin:8px 0}.muted{color:#8a7661;font-size:12px}
+table{width:100%;border-collapse:collapse;background:white;font-size:12px}th,td{border:1px solid #e2d2bb;padding:6px 8px;text-align:left;white-space:nowrap}th{background:#f2e3cd;position:sticky;top:0;z-index:1}th input,th select{width:100%;box-sizing:border-box;margin-top:4px;padding:3px;border:1px solid #d2b890;border-radius:3px;font-size:11px}.table-wrap{max-height:55vh;overflow:auto}.sortable{cursor:pointer}.yes{color:#176b3a;font-weight:600}.no{color:#9a3412}.pool{color:#5b4a37;font-weight:600}
+</style>
+</head>
+<body>
+<h1>短信价格检查</h1>
+<div class="toolbar"><button onclick="location.href='/'">返回主页</button><button onclick="loadData()">触发价格检查</button><button onclick="loadData()">刷新</button><span id="status" class="muted">等待加载</span></div>
+<div id="errors"></div>
+<div class="card"><h2>价格检查表</h2><div class="table-wrap"><table id="price-table"><thead><tr>
+<th>短信平台<select data-filter="sms_provider"><option value="">全部</option></select></th>
+<th>国家/地区id<select data-filter="country"><option value="">全部</option></select></th>
+<th>国家/地区名称</th>
+<th class="sortable" data-sort="number" onclick="sortTable('price','lowest_price')">最低价格</th>
+<th class="sortable" data-sort="number" onclick="sortTable('price','second_price')">倒数第二低价格</th>
+<th class="sortable" data-sort="number" onclick="sortTable('price','lowest_count')">最低价格数量</th>
+<th class="sortable" data-sort="number" onclick="sortTable('price','second_count')">倒数第二低价格数量</th>
+<th>是否已在购买池</th>
+<th>是否推荐加入购买池</th>
+</tr></thead><tbody></tbody></table></div></div>
+<div class="card"><h2>成功价格统计</h2><div class="table-wrap"><table id="success-table"><thead><tr>
+<th>短信平台<select data-filter="sms_provider"><option value="">全部</option></select></th>
+<th>国家/地区id<select data-filter="country"><option value="">全部</option></select></th>
+<th>国家/地区名称</th>
+<th class="sortable" data-sort="number" onclick="sortTable('success','success_price')">成功价格</th>
+<th class="sortable" data-sort="number" onclick="sortTable('success','success_count')">成功次数</th>
+</tr></thead><tbody></tbody></table></div></div>
+<script>
+var state={price_rows:[],success_rows:[],sort:{price:null,success:null}};
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+function filters(tableId){var out={};document.querySelectorAll('#'+tableId+' thead input,#'+tableId+' thead select').forEach(function(i){out[i.dataset.filter]=(i.value||'').toLowerCase();});return out;}
+function rowMatches(row, fs){return Object.keys(fs).every(function(k){var q=fs[k];if(!q)return true;var v=row[k];if(typeof v==='boolean')v=v?'是':'否';var text=String(v==null?'':v).toLowerCase();if(k==='sms_provider'||k==='country')return text===q;return text.indexOf(q)>=0;});}
+function fillSelectOptions(tableId,key,rows){var s=document.querySelector('#'+tableId+' select[data-filter="'+key+'"]');if(!s)return;var current=s.value;var values=Array.from(new Set(rows.map(function(r){return String(r[key]||'');}).filter(Boolean))).sort(function(a,b){return a.localeCompare(b,undefined,{numeric:true});});s.innerHTML='<option value="">全部</option>'+values.map(function(v){return '<option value="'+esc(v)+'">'+esc(v)+'</option>';}).join('');if(values.indexOf(current)>=0)s.value=current;}
+function updatePriceFilterOptions(){fillSelectOptions('price-table','sms_provider',state.price_rows);fillSelectOptions('price-table','country',state.price_rows);}
+function numberValue(v){var n=parseFloat(v);return isNaN(n)?-1:n;}
+function sortTable(kind,key){state.sort[kind]={key:key,dir:state.sort[kind]&&state.sort[kind].key===key?-state.sort[kind].dir:1};render();}
+function sortedRows(kind,rows){var s=state.sort[kind];if(!s)return rows;return rows.slice().sort(function(a,b){var av=a[s.key],bv=b[s.key];var an=numberValue(av),bn=numberValue(bv);if(an>=0||bn>=0)return (an-bn)*s.dir;return String(av||'').localeCompare(String(bv||''))*s.dir;});}
+function renderPrice(){var fs=filters('price-table');var rows=sortedRows('price',state.price_rows).filter(function(r){return rowMatches(r,fs);});document.querySelector('#price-table tbody').innerHTML=rows.map(function(r){var pool=r.in_purchase_pool?'是':'否';var cls=r.in_purchase_pool?'pool':(String(r.recommendation||'').indexOf('推荐')===0?'yes':'no');return '<tr><td>'+esc(r.sms_provider)+'</td><td>'+esc(r.country)+'</td><td>'+esc(r.country_name||'-')+'</td><td>'+esc(r.lowest_price)+'</td><td>'+esc(r.second_price)+'</td><td>'+esc(r.lowest_count)+'</td><td>'+esc(r.second_count)+'</td><td>'+pool+'</td><td class="'+cls+'">'+esc(r.recommendation)+'</td></tr>';}).join('')||'<tr><td colspan="9">无数据</td></tr>';}
+function renderSuccess(){var fs=filters('success-table');var rows=sortedRows('success',state.success_rows).filter(function(r){return rowMatches(r,fs);});document.querySelector('#success-table tbody').innerHTML=rows.map(function(r){return '<tr><td>'+esc(r.sms_provider)+'</td><td>'+esc(r.country)+'</td><td>'+esc(r.country_name||'-')+'</td><td>'+esc(r.success_price)+'</td><td>'+esc(r.success_count)+'</td></tr>';}).join('')||'<tr><td colspan="5">无数据</td></tr>';}
+function render(){renderPrice();renderSuccess();}
+function loadData(){document.getElementById('status').textContent='加载中...';fetch('/api/sms-price-check').then(function(r){return r.json();}).then(function(j){state.price_rows=j.price_rows||[];state.success_rows=j.success_rows||[];document.getElementById('status').textContent='价格 '+state.price_rows.length+' 行，成功统计 '+state.success_rows.length+' 行';document.getElementById('errors').innerHTML=(j.errors||[]).map(function(e){return '<div class="error">'+esc(e)+'</div>';}).join('');updatePriceFilterOptions();render();}).catch(function(e){document.getElementById('status').textContent='加载失败';document.getElementById('errors').innerHTML='<div class="error">'+esc(e.message||e)+'</div>';});}
+document.querySelectorAll('thead input,thead select').forEach(function(i){i.addEventListener('input',render);i.addEventListener('change',render);i.addEventListener('click',function(e){e.stopPropagation();});});
+loadData();
+</script>
+</body>
+</html>
+"""
+
 _HTML = """<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ChatGPT Auto Register</title>
@@ -2287,7 +2400,9 @@ input,select,textarea{font:inherit}
 .brand-name{font-family:var(--serif);font-size:26px;letter-spacing:0}
 .brand-meta{color:var(--ink-faint);font-family:var(--mono);font-size:11px;letter-spacing:0.28em;text-transform:uppercase}
 #status-msg{min-width:52px;letter-spacing:0;text-transform:none;font-family:var(--sans);font-size:13px;color:var(--ink-soft)}
-.nav-links{display:flex;align-items:center;justify-content:flex-end;gap:24px;width:100%;color:var(--ink-soft);font-size:13px}
+.nav-links{display:flex;align-items:center;margin-left:auto;gap:24px;color:var(--ink-soft);font-size:13px}
+.nav-primary{display:flex;align-items:center;gap:24px;min-width:max-content}
+.nav-secondary{display:flex;align-items:center;gap:24px;min-width:max-content}
 .nav-action{background:none;border:0;padding:4px 8px;font-size:13px;color:var(--ink-soft)}
 .nav-action.active{color:var(--ink);border-bottom:1px solid var(--ink)}
 .nav-action:hover{color:var(--ink)}
@@ -2349,6 +2464,14 @@ button:disabled{opacity:0.4;cursor:not-allowed}
 .outlook-pool-pill{display:inline-flex;align-items:center;padding:2px 8px;border:1px solid var(--rule);font-size:11px;color:var(--ink-soft);background:rgba(255,255,255,0.4)}
 .outlook-pool-pager{display:flex;align-items:center;gap:8px;margin-top:12px;font-size:12px;color:var(--ink-faint)}
 .outlook-pool-empty{padding:24px;color:var(--ink-faint);text-align:center}
+.sms-price-table-wrap{max-height:55vh;overflow:auto}
+.sms-price-table{width:100%;border-collapse:collapse;background:rgba(255,255,255,0.7);font-size:12px}
+.sms-price-table th,.sms-price-table td{border:1px solid var(--rule);padding:6px 8px;text-align:left;white-space:nowrap}
+.sms-price-table th{background:rgba(243,239,228,.85);position:sticky;top:0;z-index:1;color:var(--ink-soft);font-size:12px;font-weight:500;letter-spacing:0.04em;vertical-align:top;border-top:0;border-left:0;border-right:0;border-bottom:1px solid var(--rule-strong)}
+.sms-price-table th select{display:inline-block;width:92px;max-width:96px;box-sizing:border-box;margin:0 0 0 8px;padding:3px 18px 3px 8px;font-size:11px;border-radius:999px;background:rgba(255,255,255,0.78);color:var(--ink-soft);border:1px solid var(--rule)}
+.sms-price-sortable{cursor:pointer}
+.sms-price-yes{color:var(--green);font-weight:600}.sms-price-no{color:#9a3412}.sms-price-pool{color:var(--ink-soft);font-weight:600}
+.sms-price-error{color:var(--red);font-size:13px;margin:8px 0}
 .outlook-pool-detail-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
 .outlook-pool-detail-item{padding:10px 12px;border:1px solid var(--rule);background:rgba(255,255,255,0.35)}
 .outlook-pool-detail-item .k{display:block;font-size:11px;color:var(--ink-faint);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px}
@@ -2376,10 +2499,14 @@ button:disabled{opacity:0.4;cursor:not-allowed}
     </button>
     <span class="brand-meta" id="status-msg">就绪</span>
     <nav class="nav-links">
-      <button class="nav-action" onclick="downloadResults()">下载结果</button>
-      <span class="nav-divider"></span>
-      <span class="nav-action" id="balance">-</span>
-      <span class="brand-meta">SMSBower</span>
+      <div class="nav-primary">
+        <button class="nav-action" id="nav-sms-price-check" type="button" onclick="switchView(&quot;sms-price-check&quot;)">短信价格检查</button>
+      </div>
+      <div class="nav-secondary">
+        <span class="nav-action" id="balance">-</span>
+        <span class="brand-meta">SMSBower</span>
+        <button class="nav-action" id="nav-download-results" onclick="downloadResults()">下载结果</button>
+      </div>
     </nav>
   </header>
 
@@ -2395,7 +2522,7 @@ button:disabled{opacity:0.4;cursor:not-allowed}
       <div class="col">
         <div class="card"><h2>注册配置</h2>
           <label>短信平台</label>
-          <select id="sms_provider" style="width:100%;padding:8px 10px;background:#fdf8f0;border:1px solid #d4b896;border-radius:4px;color:#4a3728;font-size:13px">
+          <select id="sms_provider" onchange="applySmsProviderConfig()" style="width:100%;padding:8px 10px;background:#fdf8f0;border:1px solid #d4b896;border-radius:4px;color:#4a3728;font-size:13px">
             <option value="smsbower">SMSBower</option>
             <option value="hero-sms">Hero-SMS</option>
           </select>
@@ -2414,6 +2541,7 @@ button:disabled{opacity:0.4;cursor:not-allowed}
             <div style="flex:1"><label>步骤重试</label><input id="retries" value="2" type="number" min="0" max="10"></div>
           </div>
           <div style="margin-top:12px;display:flex;gap:8px">
+            <button class="btn-neutral" id="btn-save-config" onclick="saveConfigOnly()" style="flex:1">保存配置</button>
             <button class="btn-primary" id="btn-start" onclick="startReg()" style="flex:1">开始注册</button>
             <button class="btn-neutral" id="btn-phase2" onclick="openBatchPanel()" style="flex:1">Phase 2 补跑</button>
             <button class="btn-neutral" onclick="openFailedUploadsPanel()" style="flex:1">失败上传补传</button>
@@ -2569,7 +2697,8 @@ function escapeHtml(s){
 }
 
 var currentView='main';
-// bootstrap markers: id="view-main" id="view-outlook-pool" id="outlook-pool-summary" id="outlook-pool-list" id="outlook-pool-detail" id="outlook-pool-messages"
+// bootstrap markers: id="view-main" id="view-outlook-pool" id="view-sms-price-check" id="nav-sms-price-check" id="outlook-pool-summary" id="outlook-pool-list" id="outlook-pool-detail" id="outlook-pool-messages"
+var smsPriceState={price_rows:[],success_rows:[],sort:{price:null,success:null},loaded:false};
 var outlookPoolState={
   loaded:false,
   page:1,
@@ -2668,24 +2797,82 @@ function bootstrapOutlookPoolView(){
     ].join('');
     content.appendChild(outlookView);
   }
-  var nav=document.querySelector('.nav-links');
-  if(nav && !G('nav-main')){
-    nav.insertAdjacentHTML('afterbegin','<button class="nav-action active" id="nav-main" type="button" onclick="switchView(&quot;main&quot;)">主页</button><button class="nav-action" id="nav-outlook-pool" type="button" onclick="switchView(&quot;outlook-pool&quot;)">Outlook 池</button>');
+  if(content && !G('view-sms-price-check')){
+    var smsPriceView=document.createElement('div');
+    smsPriceView.id='view-sms-price-check';
+    smsPriceView.className='view';
+    smsPriceView.style.display='none';
+    smsPriceView.innerHTML=[
+      '<div class="card">',
+      '  <h2>短信价格检查</h2>',
+      '  <div style="display:flex;gap:8px;align-items:center;margin-bottom:12px">',
+      '    <button class="btn-primary" type="button" onclick="loadSmsPriceCheck()">触发价格检查</button>',
+      '    <button class="btn-neutral" type="button" onclick="loadSmsPriceCheck()">刷新</button>',
+      '    <span id="sms-price-status" style="font-size:12px;color:var(--ink-faint)">等待加载</span>',
+      '  </div>',
+      '  <div id="sms-price-errors"></div>',
+      '</div>',
+      '<div class="card"><h2>价格检查表</h2><div class="sms-price-table-wrap"><table id="sms-price-table" class="sms-price-table"><thead><tr>',
+      '<th>短信平台<select data-filter="sms_provider"><option value="">全部</option></select></th>',
+      '<th>国家/地区id<select data-filter="country"><option value="">全部</option></select></th>',
+      '<th>国家/地区名称</th>',
+      '<th class="sms-price-sortable" data-sort="number" onclick="sortSmsPriceTable(\\'price\\',\\'lowest_price\\')">最低价格</th>',
+      '<th class="sms-price-sortable" data-sort="number" onclick="sortSmsPriceTable(\\'price\\',\\'second_price\\')">倒数第二低价格</th>',
+      '<th class="sms-price-sortable" data-sort="number" onclick="sortSmsPriceTable(\\'price\\',\\'lowest_count\\')">最低价格数量</th>',
+      '<th class="sms-price-sortable" data-sort="number" onclick="sortSmsPriceTable(\\'price\\',\\'second_count\\')">倒数第二低价格数量</th>',
+      '<th>是否已在购买池</th>',
+      '<th>是否推荐加入购买池</th>',
+      '</tr></thead><tbody></tbody></table></div></div>',
+      '<div class="card"><h2>成功价格统计</h2><div class="sms-price-table-wrap"><table id="sms-success-table" class="sms-price-table"><thead><tr>',
+      '<th>短信平台<select data-filter="sms_provider"><option value="">全部</option></select></th>',
+      '<th>国家/地区id<select data-filter="country"><option value="">全部</option></select></th>',
+      '<th>国家/地区名称</th>',
+      '<th class="sms-price-sortable" data-sort="number" onclick="sortSmsPriceTable(\\'success\\',\\'success_price\\')">成功价格</th>',
+      '<th class="sms-price-sortable" data-sort="number" onclick="sortSmsPriceTable(\\'success\\',\\'success_count\\')">成功次数</th>',
+      '</tr></thead><tbody></tbody></table></div></div>'
+    ].join('');
+    content.appendChild(smsPriceView);
+    smsPriceView.querySelectorAll('thead select').forEach(function(i){
+      i.addEventListener('input',renderSmsPriceCheck);
+      i.addEventListener('change',renderSmsPriceCheck);
+      i.addEventListener('click',function(e){e.stopPropagation();});
+    });
+  }
+  var navPrimary=document.querySelector('.nav-primary') || document.querySelector('.nav-links');
+  if(navPrimary && !G('nav-main')){
+    navPrimary.insertAdjacentHTML('afterbegin','<button class="nav-action active" id="nav-main" type="button" onclick="switchView(&quot;main&quot;)">主页</button><button class="nav-action" id="nav-outlook-pool" type="button" onclick="switchView(&quot;outlook-pool&quot;)">Outlook 池</button>');
   }
   var brand=document.querySelector('.brand');
   if(brand)brand.setAttribute('onclick',"switchView('main')");
 }
 
 function switchView(view){
-  currentView=(view==='outlook-pool')?'outlook-pool':'main';
+  currentView=(view==='outlook-pool'||view==='sms-price-check')?view:'main';
   if(G('view-main'))G('view-main').style.display=(currentView==='main'?'':'none');
   if(G('view-outlook-pool'))G('view-outlook-pool').style.display=(currentView==='outlook-pool'?'':'none');
+  if(G('view-sms-price-check'))G('view-sms-price-check').style.display=(currentView==='sms-price-check'?'':'none');
   if(G('nav-main'))G('nav-main').classList.toggle('active',currentView==='main');
   if(G('nav-outlook-pool'))G('nav-outlook-pool').classList.toggle('active',currentView==='outlook-pool');
+  if(G('nav-sms-price-check'))G('nav-sms-price-check').classList.toggle('active',currentView==='sms-price-check');
   if(currentView==='outlook-pool' && !outlookPoolState.loaded){
     loadOutlookPool();
   }
+  if(currentView==='sms-price-check' && !smsPriceState.loaded){
+    loadSmsPriceCheck();
+  }
 }
+
+function smsPriceFilters(tableId){var out={};document.querySelectorAll('#'+tableId+' thead select').forEach(function(i){out[i.dataset.filter]=(i.value||'').toLowerCase();});return out;}
+function smsPriceRowMatches(row,fs){return Object.keys(fs).every(function(k){var q=fs[k];if(!q)return true;return String(row[k]==null?'':row[k]).toLowerCase()===q;});}
+function fillSmsPriceSelectOptions(tableId,key,rows){var s=document.querySelector('#'+tableId+' select[data-filter="'+key+'"]');if(!s)return;var current=s.value;var values=Array.from(new Set(rows.map(function(r){return String(r[key]||'');}).filter(Boolean))).sort(function(a,b){return a.localeCompare(b,undefined,{numeric:true});});s.innerHTML='<option value="">全部</option>'+values.map(function(v){return '<option value="'+escapeHtml(v)+'">'+escapeHtml(v)+'</option>';}).join('');if(values.indexOf(current)>=0)s.value=current;}
+function updateSmsPriceFilterOptions(){fillSmsPriceSelectOptions('sms-price-table','sms_provider',smsPriceState.price_rows);fillSmsPriceSelectOptions('sms-price-table','country',smsPriceState.price_rows);fillSmsPriceSelectOptions('sms-success-table','sms_provider',smsPriceState.success_rows);fillSmsPriceSelectOptions('sms-success-table','country',smsPriceState.success_rows);}
+function smsPriceNumberValue(v){var n=parseFloat(v);return isNaN(n)?-1:n;}
+function sortSmsPriceTable(kind,key){smsPriceState.sort[kind]={key:key,dir:smsPriceState.sort[kind]&&smsPriceState.sort[kind].key===key?-smsPriceState.sort[kind].dir:1};renderSmsPriceCheck();}
+function sortedSmsPriceRows(kind,rows){var s=smsPriceState.sort[kind];if(!s)return rows;return rows.slice().sort(function(a,b){var av=a[s.key],bv=b[s.key];var an=smsPriceNumberValue(av),bn=smsPriceNumberValue(bv);if(an>=0||bn>=0)return (an-bn)*s.dir;return String(av||'').localeCompare(String(bv||''))*s.dir;});}
+function renderSmsPriceRows(){if(!G('sms-price-table'))return;var fs=smsPriceFilters('sms-price-table');var rows=sortedSmsPriceRows('price',smsPriceState.price_rows).filter(function(r){return smsPriceRowMatches(r,fs);});G('sms-price-table').querySelector('tbody').innerHTML=rows.map(function(r){var pool=r.in_purchase_pool?'是':'否';var cls=r.in_purchase_pool?'sms-price-pool':(String(r.recommendation||'').indexOf('推荐')===0?'sms-price-yes':'sms-price-no');return '<tr><td>'+escapeHtml(r.sms_provider)+'</td><td>'+escapeHtml(r.country)+'</td><td>'+escapeHtml(r.country_name||'-')+'</td><td>'+escapeHtml(r.lowest_price)+'</td><td>'+escapeHtml(r.second_price)+'</td><td>'+escapeHtml(r.lowest_count)+'</td><td>'+escapeHtml(r.second_count)+'</td><td>'+pool+'</td><td class="'+cls+'">'+escapeHtml(r.recommendation)+'</td></tr>';}).join('')||'<tr><td colspan="9">无数据</td></tr>';}
+function renderSmsSuccessRows(){if(!G('sms-success-table'))return;var fs=smsPriceFilters('sms-success-table');var rows=sortedSmsPriceRows('success',smsPriceState.success_rows).filter(function(r){return smsPriceRowMatches(r,fs);});G('sms-success-table').querySelector('tbody').innerHTML=rows.map(function(r){return '<tr><td>'+escapeHtml(r.sms_provider)+'</td><td>'+escapeHtml(r.country)+'</td><td>'+escapeHtml(r.country_name||'-')+'</td><td>'+escapeHtml(r.success_price)+'</td><td>'+escapeHtml(r.success_count)+'</td></tr>';}).join('')||'<tr><td colspan="5">无数据</td></tr>';}
+function renderSmsPriceCheck(){renderSmsPriceRows();renderSmsSuccessRows();}
+function loadSmsPriceCheck(){smsPriceState.loaded=true;if(G('sms-price-status'))G('sms-price-status').textContent='加载中...';return fetch('/api/sms-price-check').then(function(r){return r.json();}).then(function(j){smsPriceState.price_rows=j.price_rows||[];smsPriceState.success_rows=j.success_rows||[];if(G('sms-price-status'))G('sms-price-status').textContent='价格 '+smsPriceState.price_rows.length+' 行，成功统计 '+smsPriceState.success_rows.length+' 行';if(G('sms-price-errors'))G('sms-price-errors').innerHTML=(j.errors||[]).map(function(e){return '<div class="sms-price-error">'+escapeHtml(e)+'</div>';}).join('');updateSmsPriceFilterOptions();renderSmsPriceCheck();return j;}).catch(function(e){if(G('sms-price-status'))G('sms-price-status').textContent='加载失败';if(G('sms-price-errors'))G('sms-price-errors').innerHTML='<div class="sms-price-error">'+escapeHtml(e.message||e)+'</div>';return null;});}
 
 function loadOutlookPool(){
   outlookPoolState.loaded=true;
@@ -2842,7 +3029,8 @@ function renderOutlookPoolList(){
       var when=item.last_event_time||item.last_result_time||'-';
       var record=item.has_result?'有本地结果':'无本地结果';
       var current=item.is_current_bind?'<span class="outlook-pool-pill">当前绑定</span>':'';
-      return '<button class="outlook-pool-row'+active+'" type="button" onclick="selectOutlookPoolEmail('+JSON.stringify(item.email)+')"><div class="title"><span>'+escapeHtml(item.email)+'</span><span class="outlook-pool-pill">'+escapeHtml(item.status_label||item.status||'')+'</span>'+current+'</div><div class="meta"><span>'+escapeHtml(when)+'</span><span>'+escapeHtml(record)+'</span></div></button>';
+      var onclickAttr='selectOutlookPoolEmail('+JSON.stringify(item.email)+')';
+      return '<button class="outlook-pool-row'+active+'" type="button" onclick="'+escapeHtml(onclickAttr)+'"><div class="title"><span>'+escapeHtml(item.email)+'</span><span class="outlook-pool-pill">'+escapeHtml(item.status_label||item.status||'')+'</span>'+current+'</div><div class="meta"><span>'+escapeHtml(when)+'</span><span>'+escapeHtml(record)+'</span></div></button>';
     }).join('');
   }
   var totalPages=Math.max(1,Math.ceil((outlookPoolState.total||0)/(outlookPoolState.pageSize||20)));
@@ -3075,6 +3263,12 @@ function saveConfig(){
   return fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d)}).then(function(r){return r.json()}).then(function(j){toast('配置已保存',j.ok);return j;});
 }
 
+function saveConfigOnly(){
+  saveConfig().then(function(j){
+    if(j&&j.ok){loadedConfig=j.config;checkBalance();}
+  });
+}
+
 function checkBalance(){
   fetch('/api/balance').then(function(r){return r.json()}).then(function(j){
     if(j.ok){G('balance').textContent=j.balance.replace('ACCESS_BALANCE:','');}
@@ -3187,15 +3381,25 @@ function toggleEmailProviderFields(){
   G('icloud-group').style.display=(v==''?'':'none');
 }
 
+var loadedConfig=null;
+function applySmsProviderConfig(){
+  var cfg=loadedConfig||{};
+  var provider=G('sms_provider').value||'smsbower';
+  var p=((cfg.sms||{}).providers||{})[provider]||{};
+  G('api_key').value=p.api_key||'';
+  G('countries').value=(p.countries||[]).join(',');
+  G('max_price').value=p.max_price||'0.03';
+}
+
 function loadConfig(){
   fetch('/api/config').then(function(r){return r.json()}).then(function(j){
     if(!j.ok)return;
     var c=j.config;
+    loadedConfig=c;
     // New sms.* config
     if(c.sms){
-      G('sms_provider').value=c.sms.provider||'smsbower';
-      G('api_key').value=c.sms.api_key||'';
-      G('countries').value=(c.sms.countries||[]).join(',');
+      G('sms_provider').value=c.sms.provider||c.sms.active_provider||'smsbower';
+      applySmsProviderConfig();
     } else if(c.smsbower) {
       // Legacy fallback
       G('sms_provider').value='smsbower';
