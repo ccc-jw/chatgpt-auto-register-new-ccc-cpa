@@ -18,3 +18,10 @@ email_pool*.json
 outlook.txt
 outlook_used.txt
 sms_success_prices.json
+# Runtime temporary files
+.claude/
+failed_uploads/
+logs/
+results_*.json
+* 2.py
+webui.log
