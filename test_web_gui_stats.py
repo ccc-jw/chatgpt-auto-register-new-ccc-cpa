@@ -94,6 +94,7 @@ class WebGuiStatsTests(unittest.TestCase):
         self.assertEqual(orders, [countries, countries, countries])
 
     def test_run_counts_phase2_final_success_toward_target(self):
+        web_gui._state["stats"] = web_gui._empty_stats()
         config = {
             "sms": {
                 "provider": "smsbower",
