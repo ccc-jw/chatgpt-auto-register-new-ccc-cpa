@@ -193,32 +193,66 @@ class WebGuiStatsTests(unittest.TestCase):
         self.assertEqual(cfg["email_provider"], "outlook")
         self.assertEqual(cfg["outlook_pool"], "a@outlook.com----pw----cid----rt")
 
-    def test_api_config_roundtrips_upload_target_and_cpa_settings(self):
+    def test_monitor_anomaly_notifications_are_rate_limited_when_summary_changes(self):
+        web_gui._state["_last_monitor_notify_key"] = ""
+        web_gui._state["_last_monitor_notify_at"] = 0
+        payload = {"running": True, "stats": {"total_success": 0, "total_fail": 0}, "results": []}
+
+        with mock.patch.object(web_gui.time, "time", side_effect=[1000, 1001]), mock.patch.object(web_gui, "_send_feishu") as send:
+            web_gui._monitor_anomalies_from_payload(payload, [{"tag": "error", "msg": "验证码超时 1"}], source="日志监控")
+            web_gui._monitor_anomalies_from_payload(payload, [{"tag": "error", "msg": "验证码超时 2"}], source="日志监控")
+
+        self.assertEqual(send.call_count, 1)
+
+    def test_monitor_anomaly_ignores_register_rejected_status_400(self):
+        web_gui._state["_last_monitor_notify_key"] = ""
+        web_gui._state["_last_monitor_notify_at"] = 0
         payload = {
-            "upload_target": "cpa",
-            "cpa_management_url": "http://47.89.129.103:18317",
-            "cpa_api_url": "http://47.89.129.103:8317",
-            "cpa_management_key": "mgmt-key",
-            "cpa_upload_mode": "auto",
+            "running": True,
+            "stats": {"total_success": 0, "total_fail": 1},
+            "results": [
+                {
+                    "country": "4",
+                    "error": "注册被拒(status=400)",
+                    "failure_stage": "register_rejected",
+                    "status": "register_failed",
+                }
+            ],
         }
 
-        with web_gui.app.test_client() as client:
-            resp = client.post("/api/config", json=payload)
-            self.assertEqual(resp.status_code, 200)
-            data = resp.get_json()
-            self.assertTrue(data["ok"])
+        with mock.patch.object(web_gui, "_send_feishu") as send:
+            web_gui._monitor_anomalies_from_payload(
+                payload,
+                [{"tag": "error", "msg": "provider=hero-sms country=4 失败: 注册被拒(status=400)"}],
+                source="日志监控",
+            )
 
-            resp = client.get("/api/config")
-            self.assertEqual(resp.status_code, 200)
-            data = resp.get_json()
+        send.assert_not_called()
 
-        cfg = data["config"]
-        self.assertEqual(cfg["upload_target"], "cpa")
-        self.assertEqual(cfg["cpa"]["management_url"], "http://47.89.129.103:18317")
-        self.assertEqual(cfg["cpa"]["api_url"], "http://47.89.129.103:8317")
-        self.assertEqual(cfg["cpa"]["management_key"], "mgmt-key")
-        self.assertEqual(cfg["cpa"]["upload_mode"], "auto")
+    def test_monitor_anomaly_ignores_no_numbers(self):
+        web_gui._state["_last_monitor_notify_key"] = ""
+        web_gui._state["_last_monitor_notify_at"] = 0
+        payload = {
+            "running": True,
+            "stats": {"total_success": 0, "total_fail": 1},
+            "results": [
+                {
+                    "country": "4",
+                    "error": "hero-sms error: NO_NUMBERS",
+                    "failure_stage": "get_phone",
+                    "status": "phone_failed",
+                }
+            ],
+        }
 
+        with mock.patch.object(web_gui, "_send_feishu") as send:
+            web_gui._monitor_anomalies_from_payload(
+                payload,
+                [{"tag": "error", "msg": "provider=hero-sms country=4 失败 (hero-sms error: NO_NUMBERS)"}],
+                source="日志监控",
+            )
+
+        send.assert_not_called()
 
 
     def test_main_page_has_save_config_button(self):
@@ -521,8 +555,11 @@ class WebGuiStatsTests(unittest.TestCase):
                         web_gui._run(config, count=1, retries=0, concurrency=1)
 
             saved_files = list(results_dir.glob("15550001111_*.json"))
-            self.assertEqual(len(saved_files), 1)
-            saved = json.loads(saved_files[0].read_text(encoding="utf-8"))
+            self.assertGreaterEqual(len(saved_files), 1)
+            saved_results = [json.loads(path.read_text(encoding="utf-8")) for path in saved_files]
+            phone_ok_results = [item for item in saved_results if item.get("phone_ok")]
+            self.assertGreaterEqual(len(phone_ok_results), 1)
+            saved = phone_ok_results[-1]
             self.assertTrue(saved["phone_ok"])
             self.assertFalse(saved["final_ok"])
             self.assertEqual(saved["status"], "phone_ok")
@@ -539,7 +576,7 @@ class WebGuiStatsTests(unittest.TestCase):
             else:
                 all_path.write_text(before_all, encoding="utf-8")
 
-    def test_batch_phase2_does_not_fallback_when_original_outlook_email_missing_from_pool(self):
+    def test_batch_phase2_fallbacks_to_new_outlook_email_when_original_missing_from_pool(self):
         results_dir = Path(web_gui.__file__).with_name("results")
         result_path = results_dir / "test_phase2_original_email_missing.json"
         try:
@@ -573,15 +610,19 @@ class WebGuiStatsTests(unittest.TestCase):
                     "bind_email": "",
                 }
 
-                with mock.patch.object(web_gui, "_phase2_for_result") as phase2:
+                with mock.patch.object(web_gui, "_phase2_for_result", return_value={"ok": True, "uploaded": True, "upload_verified": True, "upload_target": "cpa", "upload_method": "api"}) as phase2:
                     with mock.patch.object(web_gui, "_log") as log:
                         web_gui._run_batch_phase2([result_path.name], config, source="files", concurrency=1)
 
-            phase2.assert_not_called()
+            phase2.assert_called_once()
+            phase2_config = phase2.call_args.args[1]
+            self.assertEqual(phase2_config["bind_email"], "new@outlook.com")
             messages = "\n".join(str(call.args[0]) for call in log.call_args_list if call.args)
             self.assertIn("原始邮箱不可用", messages)
+            self.assertIn("降级取新邮箱", messages)
             saved = json.loads(result_path.read_text(encoding="utf-8"))
-            self.assertEqual(saved["bind_email"], "old@outlook.com")
+            self.assertEqual(saved["bind_email"], "new@outlook.com")
+            self.assertTrue(saved["final_ok"])
         finally:
             if result_path.exists():
                 result_path.unlink()

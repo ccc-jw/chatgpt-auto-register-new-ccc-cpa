@@ -61,6 +61,11 @@ _state = {
     "log_lines": [], "log_cursor": 0,
     "code_queue": queue.Queue(),
     "pause_queue": queue.Queue(),
+    "_target_count": 0,
+    "_target_notified": False,
+    "_last_monitor_notify_key": "",
+    "_last_monitor_notify_at": 0,
+    "_last_log_notify_cursor": 0,
     "_paused": False, "_need_code": False,
     "_code_queues": {},
     "_code_waiting": {},
@@ -88,7 +93,7 @@ def _reset_current_stats():
         stats["current_fail"] = 0
 
 
-def _record_stat(success: bool):
+def _record_stat(success: bool, result: dict = None):
     with _STATE_LOCK:
         stats = _ensure_stats()
         if success:
@@ -97,6 +102,129 @@ def _record_stat(success: bool):
         else:
             stats["current_fail"] += 1
             stats["total_fail"] += 1
+    # 发送飞书通知
+    _notify_registration_status(success, result)
+
+
+# ── 飞书通知 ──
+_feishu_last_notify = 0
+_feishu_notify_interval = 300  # 常规通知最少 5 分钟间隔
+_feishu_failure_burst = {"window_start": 0, "count": 0}
+_feishu_failure_burst_window = 60
+_feishu_failure_burst_threshold = 3
+
+
+def _get_feishu_webhook() -> str:
+    """获取飞书 webhook 地址（优先从配置读取，其次环境变量）"""
+    cfg = _state.get("config", {})
+    webhook = cfg.get("feishu_webhook", "") or os.environ.get("FEISHU_WEBHOOK", "")
+    return str(webhook).strip()
+
+
+def _send_feishu(message: str, force: bool = False):
+    """发送飞书通知（默认带节流，force=True 用于关键通知）"""
+    webhook = _get_feishu_webhook()
+    if not webhook:
+        return
+    global _feishu_last_notify
+    now = time.time()
+    if not force and now - _feishu_last_notify < _feishu_notify_interval:
+        return
+    _feishu_last_notify = now
+    try:
+        import requests
+        requests.post(
+            webhook,
+            json={"msg_type": "text", "content": {"text": message}},
+            timeout=5,
+        )
+    except Exception as e:
+        print(f"[飞书] 发送失败: {e}")
+
+
+def _notify_registration_status(success: bool, result: dict = None):
+    """注册状态通知"""
+    with _STATE_LOCK:
+        stats = _ensure_stats()
+        total_success = stats["total_success"]
+        total_fail = stats["total_fail"]
+        target_count = int(_state.get("_target_count") or 0)
+        target_notified = bool(_state.get("_target_notified"))
+
+    if success:
+        msg = f"✅ 注册成功\n总数: {total_success} 成功 / {total_fail} 失败"
+    else:
+        error_info = ""
+        if result:
+            error_info = f"\n错误: {result.get('error', '未知')}"
+            error_info += f"\n国家: {result.get('country', '未知')}"
+        msg = f"❌ 注册失败\n总数: {total_success} 成功 / {total_fail} 失败{error_info}"
+
+    force = False
+    if not success:
+        now = time.time()
+        if now - _feishu_failure_burst["window_start"] > _feishu_failure_burst_window:
+            _feishu_failure_burst["window_start"] = now
+            _feishu_failure_burst["count"] = 0
+        _feishu_failure_burst["count"] += 1
+        force = _feishu_failure_burst["count"] >= _feishu_failure_burst_threshold
+        if force:
+            msg = f"⚠️ 短时间内失败 {_feishu_failure_burst['count']} 次\n" + msg
+            _feishu_failure_burst["count"] = 0
+            _feishu_failure_burst["window_start"] = now
+
+    _send_feishu(msg, force=force)
+
+    if success and target_count and total_success >= target_count and not target_notified:
+        with _STATE_LOCK:
+            if not _state.get("_target_notified"):
+                _state["_target_notified"] = True
+                _send_feishu(f"🎯 注册成功数已达到目标\n目标: {target_count}\n当前: {total_success} 成功 / {total_fail} 失败", force=True)
+
+
+def _is_normal_registration_noise(text: str) -> bool:
+    text = str(text)
+    return "注册被拒(status=400)" in text or "NO_NUMBERS" in text
+
+
+def _monitor_anomalies_from_payload(payload: dict, log_lines: list = None, source: str = "监控"):
+    stats = payload.get("stats", {}) or {}
+    running = payload.get("running")
+    results = payload.get("results", []) or []
+    anomalies = []
+    for result in results:
+        error = str(result.get("error") or "")
+        status = str(result.get("status") or "")
+        stage = str(result.get("failure_stage") or "")
+        text = " ".join([error, status, stage])
+        if _is_normal_registration_noise(text):
+            continue
+        if any(word in text.lower() for word in ("error", "fail", "timeout")) or any(word in text for word in ("验证码超时", "失败")):
+            anomalies.append(f"{result.get('country', '?')} {error or status or stage}".strip())
+    for line in log_lines or []:
+        msg = str(line.get("msg") or line.get("text") or "")
+        tag = str(line.get("tag") or "")
+        low = msg.lower()
+        if _is_normal_registration_noise(msg):
+            continue
+        if tag == "error" or any(word in low for word in ("error", "fail", "timeout")) or any(word in msg for word in ("验证码超时", "失败")):
+            anomalies.append(msg)
+    if not anomalies:
+        return
+    summary = "\n".join(f"- {item[:160]}" for item in anomalies[:5])
+    key = f"{running}:{stats.get('total_success')}:{stats.get('total_fail')}:{summary}"
+    now = time.time()
+    with _STATE_LOCK:
+        if _state.get("_last_monitor_notify_key") == key:
+            return
+        if now - float(_state.get("_last_monitor_notify_at") or 0) < _feishu_notify_interval:
+            return
+        _state["_last_monitor_notify_key"] = key
+        _state["_last_monitor_notify_at"] = now
+    _send_feishu(
+        f"🚨 {source}发现异常\n运行中: {running}\n成功/失败: {stats.get('total_success', 0)} / {stats.get('total_fail', 0)}\n{summary}",
+        force=True,
+    )
 
 
 def _record_result(result: dict):
@@ -273,7 +401,8 @@ def api_config():
                 "debug_mode", "no_phase2", "phase2_auto_skip", "sms_sort_by_price",
                 "plus_method", "plus_email", "plus_phone", "plus_pin",
                 "plus_country", "plus_currency", "proxy",
-                "upload_target", "cpa_management_url", "cpa_api_url", "cpa_management_key", "cpa_upload_mode"]:
+                "upload_target", "cpa_management_url", "cpa_api_url", "cpa_management_key", "cpa_upload_mode",
+                "feishu_webhook"]:
             if k in d:
                 if k == "sms_provider":
                     cfg["sms"]["active_provider"] = active_provider
@@ -311,6 +440,7 @@ def api_config():
                 elif k == "cpa_api_url": cfg["cpa"] = cfg.get("cpa", {}); cfg["cpa"]["api_url"] = d[k]
                 elif k == "cpa_management_key": cfg["cpa"] = cfg.get("cpa", {}); cfg["cpa"]["management_key"] = d[k]
                 elif k == "cpa_upload_mode": cfg["cpa"] = cfg.get("cpa", {}); cfg["cpa"]["upload_mode"] = d[k] or "auto"
+                elif k == "feishu_webhook": cfg["feishu_webhook"] = d[k]
         active_sms["max_price"] = str(active_sms.get("max_price") or ar.DEFAULT_SMS_MAX_PRICE).strip() or ar.DEFAULT_SMS_MAX_PRICE
         active_sms["countries"] = parse_countries(active_sms.get("countries", []))
         cfg["sms"].update({
@@ -499,6 +629,9 @@ def api_start():
         _state["running"] = True
         _state["stop"] = False
         _state["results"] = []
+        _state["_target_count"] = int(d.get("count", 1))
+        _state["_target_notified"] = False
+        _state["_last_monitor_notify_key"] = ""
     _reset_current_stats()
     cfg = _state["config"]
     concurrency = max(1, min(int(d.get("concurrency", 1)), 10))
@@ -512,7 +645,9 @@ def api_stop():
 
 @app.route("/api/status")
 def api_status():
-    return jsonify(_status_payload())
+    payload = _status_payload()
+    _monitor_anomalies_from_payload(payload, source="状态监控")
+    return jsonify(payload)
 
 @app.route("/api/download")
 def api_download():
@@ -599,6 +734,8 @@ def api_skip_phase2():
 @app.route("/api/log-since/<int:cursor>")
 def api_log_since(cursor):
     lines = _state["log_lines"][cursor:]
+    if lines:
+        _monitor_anomalies_from_payload(_status_payload(), lines, source="日志监控")
     return jsonify({"lines": lines, "cursor": len(_state["log_lines"])})
 
 def _result_upload_complete(data: dict) -> bool:
@@ -1248,8 +1385,10 @@ def _save_config_file(cfg: dict):
     path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 def _save_result(results_dir: Path, result: dict, config: dict):
-    # Save both final OK and phone_ok (pending Phase2) results
-    if not result.get("ok") and not result.get("phone_ok"):
+    # Save all results where SMS was charged (quota_charged or sms_provider present)
+    # This includes failed registrations so users can see which numbers were charged
+    has_sms_charge = bool(result.get("sms_provider") and result.get("country"))
+    if not result.get("ok") and not result.get("phone_ok") and not has_sms_charge:
         return
     safe = dict(result)
     safe["bind_email"] = config.get("bind_email", "")
@@ -1627,8 +1766,8 @@ def _run_batch_phase2(files: list, config: dict, email: str = "", source: str = 
                     tlog(f"[补跑] {tag} [{phone}] 使用原始邮箱: {original_email}", "info")
                     return original_email
                 except Exception as e:
-                    tlog(f"[补跑] {tag} [{phone}] 原始邮箱不可用，无法补跑已绑定邮箱账号: {e}", "error")
-                    return ""
+                    tlog(f"[补跑] {tag} [{phone}] 原始邮箱不可用，降级取新邮箱: {e}", "warn")
+                    # fall through: 继续从池中取新邮箱
             else:
                 tlog(f"[补跑] {tag} [{phone}] 使用原始邮箱: {original_email}", "info")
                 return original_email
@@ -2116,21 +2255,21 @@ def _run(config, count, retries, concurrency=1):
                 counted = False
                 if final_ok:
                     finish_registration(True)
-                    _record_stat(True)
+                    _record_stat(True, result)
                     counted = True
                     ok_num = counters["ok"]
                     sys.stdout.flush()
                     tlog(f"{tag} 注册成功: {result['phone']} [{ok_num}/{count}]", "success")
                 elif phone_ok and retryable and not (phase2_enabled and phase2_configured):
                     finish_registration(True)
-                    _record_stat(False)
+                    _record_stat(False, result)
                     counted = True
                     ok_num = counters["ok"]
                     sys.stdout.flush()
                     tlog(f"{tag} 手机号成功 (待Phase2): {result['phone']} [{ok_num}/{count}]", "warn")
                 elif not phone_ok:
                     finish_registration(False)
-                    _record_stat(False)
+                    _record_stat(False, result)
                     continue
 
                 if debug_mode:
@@ -2239,7 +2378,7 @@ def _run(config, count, retries, concurrency=1):
                 _save_result(results_dir, result, thread_cfg)
                 if not counted:
                     finish_registration(False)
-                    _record_stat(bool(result.get("final_ok")))
+                    _record_stat(bool(result.get("final_ok")), result)
                 if mm is not None and thread_cfg.get("bind_email") and phase2_ok:
                     try:
                         with provider_lock:
@@ -2535,9 +2674,10 @@ button:disabled{opacity:0.4;cursor:not-allowed}
           </label>
           <label>最高价格</label><input id="max_price" value="0.03" placeholder="默认 0.03">
           <label>密码</label><input id="password" placeholder="留空=随机">
+          <label>飞书通知 Webhook</label><input id="feishu_webhook" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/...">
           <div class="row" style="margin-top:10px">
-            <div style="flex:1"><label>目标数量</label><input id="count" value="1" type="number" min="1" max="99"></div>
-            <div style="flex:1"><label>并发线程</label><input id="concurrency" value="1" type="number" min="1" max="10"></div>
+            <div style="flex:1"><label>目标数量</label><input id="count" value="20" type="number" min="1" max="99"></div>
+            <div style="flex:1"><label>并发线程</label><input id="concurrency" value="5" type="number" min="1" max="10"></div>
             <div style="flex:1"><label>步骤重试</label><input id="retries" value="2" type="number" min="0" max="10"></div>
           </div>
           <div style="margin-top:12px;display:flex;gap:8px">
@@ -3239,7 +3379,7 @@ setInterval(pollLog,800);
 
 function saveConfig(){
     var d={sms_provider:G('sms_provider').value,api_key:G('api_key').value,proxy:G('proxy').value,countries:G('countries').value,
-    password:G('password').value,max_price:G('max_price').value,
+    password:G('password').value,max_price:G('max_price').value,feishu_webhook:G('feishu_webhook').value,
     sms_timeout:30,code_timeout:30,
     email_provider:G('email_provider').value,
     mailmanage_key:G('mailmanage_key').value,mailmanage_category:G('mailmanage_category').value,
@@ -3409,6 +3549,7 @@ function loadConfig(){
     G('proxy').value=c.proxy||'';
     G('max_price').value=(c.sms&&c.sms.max_price)||c.max_price||'0.03';
     if(c.register && c.register.password) G('password').value=c.register.password;
+    G('feishu_webhook').value=c.feishu_webhook||'';
     if(c.icloud){G('imap_user').value=c.icloud.user||'';G('imap_pass').value=c.icloud.pass||'';}
     if(c.sub2api){G('sub2api_url').value=c.sub2api.url||'';G('sub2api_email').value=c.sub2api.email||'';G('sub2api_pwd').value=c.sub2api.pwd||'';G('sub2api_group').value=c.sub2api.group||'CHATGPT';}
     G('upload_target').value=c.upload_target||'sub2api';

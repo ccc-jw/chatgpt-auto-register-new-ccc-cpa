@@ -147,8 +147,24 @@ def _get_number_with_retry(
 
         country_provider_ids = provider_ids or ""
         country_max_price = max_price or ""
+        actual_price = ""  # 实际扣费价格
         if sms.provider != "smsbower":
-            cheapest_cache[country] = (country_provider_ids, country_max_price)
+            # hero-sms: 用 getPrices 获取实际价格
+            try:
+                import requests as _requests
+                r = _requests.get(
+                    sms._base_url,
+                    params={"api_key": sms.api_key, "action": "getPrices", "service": service, "country": country},
+                    timeout=15,
+                )
+                data = r.json()
+                info = data.get(country, {}).get(service, {})
+                cost = info.get("cost")
+                if cost is not None:
+                    actual_price = str(float(cost))
+            except Exception:
+                pass
+            cheapest_cache[country] = (country_provider_ids, country_max_price, actual_price)
             return cheapest_cache[country]
 
         try:
@@ -157,6 +173,7 @@ def _get_number_with_retry(
                 raise RuntimeError("no valid cheapest provider returned")
             country_provider_ids = cheapest_provider
             country_max_price = _lower_price_limit(country_max_price, cheapest_price)
+            actual_price = str(cheapest_price)  # smsbower: 用查询到的最低价作为实际价格
             if verbose:
                 provider_msg = f" providerIds={country_provider_ids}" if country_provider_ids else ""
                 print(f"  [拿手机号] country={country} 最低价=${_format_price(cheapest_price)}{provider_msg} maxPrice={country_max_price}")
@@ -165,7 +182,7 @@ def _get_number_with_retry(
                 print(f"  [拿手机号] country={country} 查询最低价失败，跳过当前国家: {e}")
             return None
 
-        cheapest_cache[country] = (country_provider_ids, country_max_price)
+        cheapest_cache[country] = (country_provider_ids, country_max_price, actual_price)
         return cheapest_cache[country]
 
     round_no = 0
@@ -177,7 +194,7 @@ def _get_number_with_retry(
             if cheapest_args is None:
                 continue
             tried_any_country = True
-            country_provider_ids, country_max_price = cheapest_args
+            country_provider_ids, country_max_price, actual_price = cheapest_args
             for attempt in range(1, MAX_ATTEMPTS_PER_COUNTRY + 1):
                 if stop_requested and stop_requested():
                     raise StopRequested("stopped while waiting for phone number")
@@ -190,7 +207,7 @@ def _get_number_with_retry(
                         provider_ids=country_provider_ids,
                         max_price=country_max_price,
                     )
-                    return aid, phone, country, country_max_price
+                    return aid, phone, country, actual_price
                 except Exception as e:
                     if stop_requested and stop_requested():
                         raise StopRequested("stopped while waiting for phone number")

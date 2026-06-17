@@ -460,6 +460,18 @@ def _is_outlook_email(email: str) -> bool:
     return any(domain.startswith(prefix) for prefix in _OUTLOOK_DOMAIN_PREFIXES)
 
 
+def _email_in_outlook_pool(email: str, outlook_pool: str) -> bool:
+    """检查邮箱是否可用（Outlook 需要在池中，其他类型假设可用）"""
+    if not _is_outlook_email(email):
+        return True  # 非 Outlook 邮箱（如 iCloud），假设可用
+    try:
+        from outlook_mail import get_outlook_account
+        get_outlook_account(email, outlook_pool or "outlook.txt")
+        return True
+    except Exception:
+        return False
+
+
 def _poll_bind_code(
     bind_email: str,
     icloud_cookies: Dict[str, str],
@@ -508,7 +520,7 @@ def _poll_bind_code(
     ) or ""
 
 
-def _prompt_bind_code(bind_email: str) -> str:
+def _prompt_bind_code(bind_email: str, background_mode: bool = False) -> str:
     print(f"\n  [!] 自动轮询超时, 目标邮箱: {bind_email}")
     return input("  [?] 输入6位验证码: ").strip()
 
@@ -949,6 +961,7 @@ def run_second_half(
     id_token: str = "",
     account_id: str = "",
     expires_at: Any = 0,
+    background_mode: bool = True,
 ) -> Dict:
     """
     完整后半段 (基于真实端点):
@@ -1098,12 +1111,28 @@ def run_second_half(
             existing_email = ((dump.get("client_auth_session") or {}).get("email") or "").strip()
 
             if existing_email:
-                # 账号已有邮箱，OTP 已发送到现有邮箱
-                log(f"[5] 账号已有邮箱: {existing_email}，直接收取验证码 ...")
-                poll_start_after = time.time()
-                # 使用现有邮箱收取验证码，并更新 icloud_email 为实际邮箱
-                target_email = existing_email
-                icloud_email = existing_email  # 更新为实际邮箱，后续保存结果时使用
+                # 检查旧邮箱是否在池中可用
+                if _email_in_outlook_pool(existing_email, outlook_pool):
+                    # 旧邮箱可用，直接用
+                    log(f"[5] 账号已有邮箱: {existing_email}，直接收取验证码 ...")
+                    poll_start_after = time.time()
+                    target_email = existing_email
+                    icloud_email = existing_email  # 更新为实际邮箱，后续保存结果时使用
+                else:
+                    # 旧邮箱不在池中，尝试用新邮箱换绑
+                    log(f"[5] 旧邮箱 {existing_email} 不在池中，尝试换绑新邮箱 {icloud_email} ...")
+                    poll_start_after = time.time()
+                    if icloud_email:
+                        r_send = flow.send_bind_email(icloud_email)
+                        send_err = r_send.get("error", "")
+                        send_page = (r_send.get("page") or {}).get("type", "")
+                        log(f"[6] 换绑 send result: error={send_err} page={send_page}")
+                        if send_err:
+                            log(f"[6] 换绑失败: {send_err}")
+                            return {"ok": False, "error": f"rebind_failed: {send_err}"}
+                        if "otp_verification" in send_page:
+                            log("[6] 新验证码已发送到新邮箱,等待IMAP...")
+                    target_email = icloud_email
             else:
                 # 账号无邮箱，需要绑定新邮箱
                 log("[5] 账号无邮箱，发送新邮箱验证码 ...")
@@ -1125,7 +1154,7 @@ def run_second_half(
                         bind_email=target_email,
                         icloud_cookies=icloud_cookies,
                         verbose=verbose,
-                        timeout=60,
+                        timeout=120,
                         imap_user=imap_user,
                         imap_password=imap_password,
                         start_after=poll_start_after,
@@ -1142,8 +1171,7 @@ def run_second_half(
                         raise
 
                 if not code_bind:
-                    print(f"\n  [!] 自动轮询超时或失败, 目标邮箱: {target_email}")
-                    code_bind = input("  [?] 输入6位验证码: ").strip()
+                    code_bind = _prompt_bind_code(target_email, background_mode)
             if not code_bind:
                 return {"ok": False, "error": "binding code timeout"}
             log(f"[7] 验证码: {code_bind}")
@@ -1191,7 +1219,7 @@ def run_second_half(
                     bind_email=icloud_email,
                     icloud_cookies=icloud_cookies,
                     verbose=verbose,
-                    timeout=60,
+                    timeout=120,
                     imap_user=imap_user,
                     imap_password=imap_password,
                     start_after=poll_start_after,
