@@ -91,6 +91,56 @@ class FakeRegister:
         return "access-token"
 
 
+class RejectingRegister(FakeRegister):
+    def register_user(self, phone, password):
+        return {
+            "_status": 400,
+            "error": "invalid_request",
+            "code": "phone_rejected",
+            "message": "Phone number rejected",
+            "csrf": "secret-csrf",
+            "access_token": "secret-token",
+            "password": "secret-password",
+            "_body": '{"error":"invalid_request","message":"Phone number rejected","access_token":"secret-token"}',
+        }
+
+
+class RejectingRegisterWithSensitiveSafeValues(FakeRegister):
+    def register_user(self, phone, password):
+        return {
+            "_status": 400,
+            "message": "rejected access_token=secret-token csrf=secret-csrf password=secret-password",
+            "detail": "authorization=Bearer secret-token cookie=session=secret-session",
+        }
+
+
+class RejectingRegisterWithQuotedSensitiveSafeValues(FakeRegister):
+    def register_user(self, phone, password):
+        return {
+            "_status": 400,
+            "message": 'rejected {"access_token":"secret-token", "csrf": "secret-csrf"}',
+            "detail": "context {'password': 'secret-password'}",
+        }
+
+
+class RejectingRegisterWithTokenVariants(FakeRegister):
+    def register_user(self, phone, password):
+        return {
+            "_status": 400,
+            "message": "refresh_token=secret-refresh id_token=secret-id accessToken=secret-access",
+            "detail": "csrfToken=secret-csrf Bearer secret-bearer",
+        }
+
+
+class RejectingRegisterWithNaturalLanguageSensitiveValues(FakeRegister):
+    def register_user(self, phone, password):
+        return {
+            "_status": 400,
+            "message": "csrf token secret-csrf is invalid; Authorization: Basic dXNlcjpwYXNz",
+            "detail": "session secret-session expired",
+        }
+
+
 class AutoRegisterRetryTests(unittest.TestCase):
     def setUp(self):
         self.config = {
@@ -110,6 +160,90 @@ class AutoRegisterRetryTests(unittest.TestCase):
             "proxy": "",
             "code_timeout": 30,
         }
+
+    def test_register_rejected_includes_safe_diagnostic_summary(self):
+        sms = FakeSms()
+
+        with patch.object(ar, "ChatGPTRegister", RejectingRegister), patch.object(ar._time, "sleep", return_value=None):
+            result = ar.register_one(sms, self.config, verbose=False, no_phase2=True)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["failure_stage"], "register_rejected")
+        self.assertIn("status=400", result["error"])
+        self.assertIn("error=invalid_request", result["error"])
+        self.assertIn("code=phone_rejected", result["error"])
+        self.assertIn("message=Phone number rejected", result["error"])
+        self.assertNotIn("secret-csrf", result["error"])
+        self.assertNotIn("secret-token", result["error"])
+        self.assertNotIn("secret-password", result["error"])
+        self.assertTrue(sms.cancelled)
+        self.assertFalse(sms.completed)
+
+    def test_register_rejected_redacts_sensitive_assignments_inside_safe_values(self):
+        sms = FakeSms()
+
+        with patch.object(ar, "ChatGPTRegister", RejectingRegisterWithSensitiveSafeValues), patch.object(ar._time, "sleep", return_value=None):
+            result = ar.register_one(sms, self.config, verbose=False, no_phase2=True)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["failure_stage"], "register_rejected")
+        self.assertIn("status=400", result["error"])
+        self.assertIn("message=rejected", result["error"])
+        self.assertNotIn("secret-token", result["error"])
+        self.assertNotIn("secret-csrf", result["error"])
+        self.assertNotIn("secret-password", result["error"])
+        self.assertNotIn("secret-session", result["error"])
+        self.assertNotIn("access_token=", result["error"])
+        self.assertNotIn("csrf=", result["error"])
+        self.assertNotIn("password=", result["error"])
+        self.assertNotIn("authorization=", result["error"])
+        self.assertNotIn("cookie=", result["error"])
+        self.assertLessEqual(len(result["error"]), 160 + len("注册被拒()"))
+
+    def test_register_rejected_redacts_json_like_quoted_sensitive_assignments_inside_safe_values(self):
+        sms = FakeSms()
+
+        with patch.object(ar, "ChatGPTRegister", RejectingRegisterWithQuotedSensitiveSafeValues), patch.object(ar._time, "sleep", return_value=None):
+            result = ar.register_one(sms, self.config, verbose=False, no_phase2=True)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["failure_stage"], "register_rejected")
+        self.assertIn("status=400", result["error"])
+        self.assertIn("message=rejected", result["error"])
+        self.assertNotIn("secret-token", result["error"])
+        self.assertNotIn("secret-csrf", result["error"])
+        self.assertNotIn("secret-password", result["error"])
+        self.assertNotIn('"access_token":', result["error"])
+        self.assertNotIn('"csrf":', result["error"])
+        self.assertNotIn("'password':", result["error"])
+
+    def test_register_rejected_redacts_common_token_variants_and_standalone_bearer(self):
+        sms = FakeSms()
+
+        with patch.object(ar, "ChatGPTRegister", RejectingRegisterWithTokenVariants), patch.object(ar._time, "sleep", return_value=None):
+            result = ar.register_one(sms, self.config, verbose=False, no_phase2=True)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["failure_stage"], "register_rejected")
+        self.assertIn("status=400", result["error"])
+        self.assertNotIn("secret-refresh", result["error"])
+        self.assertNotIn("secret-id", result["error"])
+        self.assertNotIn("secret-access", result["error"])
+        self.assertNotIn("secret-csrf", result["error"])
+        self.assertNotIn("secret-bearer", result["error"])
+
+    def test_register_rejected_omits_natural_language_sensitive_values(self):
+        sms = FakeSms()
+
+        with patch.object(ar, "ChatGPTRegister", RejectingRegisterWithNaturalLanguageSensitiveValues), patch.object(ar._time, "sleep", return_value=None):
+            result = ar.register_one(sms, self.config, verbose=False, no_phase2=True)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["failure_stage"], "register_rejected")
+        self.assertIn("status=400", result["error"])
+        self.assertNotIn("secret-csrf", result["error"])
+        self.assertNotIn("secret-session", result["error"])
+        self.assertNotIn("dXNlcjpwYXNz", result["error"])
 
     def test_register_one_keeps_retrying_phone_acquisition_until_success(self):
         sms = FakeSms(failures_before_success=3)
