@@ -93,6 +93,43 @@ class WebGuiStatsTests(unittest.TestCase):
 
         self.assertEqual(orders, [countries, countries, countries])
 
+    def test_run_counts_phase2_final_success_toward_target(self):
+        config = {
+            "sms": {
+                "provider": "smsbower",
+                "api_key": "test",
+                "countries": ["151"],
+                "service": "dr",
+            },
+            "sub2api": {"url": "https://sub2api.example.com", "email": "admin@example.com"},
+            "upload_target": "sub2api",
+            "bind_email": "target@example.com",
+        }
+        register_results = [
+            {
+                "ok": True,
+                "phone": f"+1555000000{i}",
+                "phone_ok": True,
+                "final_ok": False,
+                "status": "phone_ok",
+                "session_token": f"session-{i}",
+                "password": "pw",
+            }
+            for i in range(10)
+        ]
+
+        with mock.patch("web_gui.UnifiedSMS") as sms_cls:
+            sms_cls.return_value.balance.return_value = "1.00"
+            with mock.patch("web_gui.ar.register_one", side_effect=register_results) as register_one:
+                with mock.patch.object(web_gui, "_phase2_for_result", return_value={"ok": True, "uploaded": True, "upload_verified": True, "sub2api_account_id": "sub-1", "upload_target": "sub2api"}):
+                    with mock.patch.object(web_gui, "_save_result"):
+                        with mock.patch.object(web_gui, "_log"):
+                            web_gui._run(config, count=2, retries=0, concurrency=1)
+
+        self.assertEqual(register_one.call_count, 2)
+        self.assertEqual(web_gui._state["stats"]["current_success"], 2)
+        self.assertEqual(web_gui._state["stats"]["total_success"], 2)
+
         CONFIG_FILE.write_text(
             json.dumps(
                 {

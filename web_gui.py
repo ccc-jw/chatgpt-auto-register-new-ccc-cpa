@@ -2377,8 +2377,9 @@ def _run(config, count, retries, concurrency=1):
 
                 _save_result(results_dir, result, thread_cfg)
                 if not counted:
-                    finish_registration(False)
-                    _record_stat(bool(result.get("final_ok")), result)
+                    counted_success = bool(result.get("final_ok"))
+                    finish_registration(counted_success)
+                    _record_stat(counted_success, result)
                 if mm is not None and thread_cfg.get("bind_email") and phase2_ok:
                     try:
                         with provider_lock:
