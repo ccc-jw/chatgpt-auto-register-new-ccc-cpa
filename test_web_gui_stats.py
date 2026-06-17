@@ -204,6 +204,32 @@ class WebGuiStatsTests(unittest.TestCase):
 
         self.assertEqual(send.call_count, 1)
 
+    def test_normal_registration_noise_matches_old_and_diagnostic_status_400(self):
+        self.assertTrue(web_gui._is_normal_registration_noise("注册被拒(status=400)"))
+        self.assertTrue(web_gui._is_normal_registration_noise("注册被拒(status=400, error=invalid_request)"))
+        self.assertTrue(web_gui._is_normal_registration_noise("注册被拒 status=400, error=invalid_request"))
+
+    def test_outlook_reservation_only_happens_after_phone_stage_success(self):
+        source = Path("web_gui.py").read_text(encoding="utf-8")
+
+        failure_continue = """elif not phone_ok:
+                    finish_registration(False)
+                    _record_stat(False, result)
+                    continue"""
+        phase2_gate = """if (
+                    phase2_enabled
+                    and phase2_configured
+                    and result.get("session_token")
+                ):"""
+        reserve_call = "new_email = reserve_phase2_email(thread_id)"
+
+        failure_index = source.index(failure_continue)
+        phase2_index = source.index(phase2_gate)
+        reserve_index = source.index(reserve_call)
+
+        self.assertLess(failure_index, phase2_index)
+        self.assertLess(phase2_index, reserve_index)
+
     def test_monitor_anomaly_ignores_register_rejected_status_400(self):
         web_gui._state["_last_monitor_notify_key"] = ""
         web_gui._state["_last_monitor_notify_at"] = 0

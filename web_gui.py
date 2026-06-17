@@ -184,7 +184,12 @@ def _notify_registration_status(success: bool, result: dict = None):
 
 def _is_normal_registration_noise(text: str) -> bool:
     text = str(text)
-    return "注册被拒(status=400)" in text or "NO_NUMBERS" in text
+    return (
+        "NO_NUMBERS" in text
+        or "注册被拒(status=400)" in text
+        or "注册被拒(status=400," in text
+        or "注册被拒 status=400" in text
+    )
 
 
 def _monitor_anomalies_from_payload(payload: dict, log_lines: list = None, source: str = "监控"):

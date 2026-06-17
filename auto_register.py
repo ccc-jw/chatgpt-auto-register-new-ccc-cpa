@@ -16,6 +16,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import secrets
 import string
 import sys
@@ -376,6 +377,56 @@ def load_config(path: str = None) -> dict:
 # 注册核心
 # ============================================================
 
+_SENSITIVE_REGISTER_ERROR_KEYS = (
+    "authorization",
+    "cookie",
+    "csrf",
+    "password",
+    "session",
+    "token",
+)
+_SENSITIVE_REGISTER_ERROR_VALUE_RE = re.compile(
+    r"""(?<!\w)["']?(?:[A-Za-z0-9_-]*(?:token|session|csrf|password|cookie|authorization)[A-Za-z0-9_-]*)["']?\s*[:=]\s*(?:(?:["']?(?:Bearer|Basic|Digest)\s+)?["'][^"']*["']|(?:(?:Bearer|Basic|Digest)\s+)?\S+)|\b(?:Bearer|Basic|Digest)\s+\S+""",
+    re.IGNORECASE,
+)
+
+
+def _is_sensitive_register_error_key(key: str) -> bool:
+    lowered = str(key).lower()
+    return any(part in lowered for part in _SENSITIVE_REGISTER_ERROR_KEYS)
+
+
+def _clean_register_error_value(value) -> str:
+    text = str(value).replace("\n", " ").replace("\r", " ").strip()
+    text = _SENSITIVE_REGISTER_ERROR_VALUE_RE.sub("<redacted>", text)
+    lowered = text.lower()
+    if any(part in lowered for part in _SENSITIVE_REGISTER_ERROR_KEYS):
+        return ""
+    return text[:160]
+
+
+def _safe_register_error_summary(result: dict) -> str:
+    parts = []
+    status = result.get("_status")
+    if status:
+        parts.append(f"status={status}")
+
+    for key in ("error", "code", "message", "detail"):
+        value = result.get(key)
+        if value and not _is_sensitive_register_error_key(key):
+            parts.append(f"{key}={_clean_register_error_value(value)}")
+
+    if len(parts) == (1 if status else 0):
+        body = result.get("_body")
+        if body:
+            body_text = _clean_register_error_value(body)
+            lowered = body_text.lower()
+            if not any(part in lowered for part in _SENSITIVE_REGISTER_ERROR_KEYS):
+                parts.append(f"body={body_text}")
+
+    return ", ".join(parts) if parts else "status=unknown"
+
+
 def register_one(
     sms: UnifiedSMS,
     config: dict,
@@ -475,9 +526,10 @@ def register_one(
         continue_url = result.get("continue_url", "")
         if not continue_url:
             sms.cancel()
+            error_summary = _safe_register_error_summary(result)
             if verbose:
-                print(f"  [5/9] 注册被拒 status={result.get('_status')}")
-            return _fail_result(phone, "register_rejected", f"注册被拒(status={result.get('_status')})", sms_provider, used_country, aid)
+                print(f"  [5/9] 注册被拒 {error_summary}")
+            return _fail_result(phone, "register_rejected", f"注册被拒({error_summary})", sms_provider, used_country, aid)
         if verbose:
             print(f"  [5/9] 手机号注册成功 continue_url 已返回")
 
