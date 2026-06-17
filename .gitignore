@@ -20,6 +20,7 @@ outlook_used.txt
 sms_success_prices.json
 # Runtime temporary files
 .claude/
+.worktrees/
 failed_uploads/
 logs/
 results_*.json
